@@ -100,7 +100,7 @@ async function initializeListingStore() {
   updatePublishAvailability();
 
   if (listingStoreMode === "firebase" && !elements.importMessage.textContent) {
-    setMessage(elements.importMessage, "Firebase 게시글 DB에 연결되었습니다.", "success");
+    setMessage(elements.importMessage, "교환 글이 로드되었습니다.", "success");
   }
 }
 
