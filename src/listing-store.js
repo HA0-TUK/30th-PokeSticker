@@ -76,9 +76,14 @@ export async function loadListingPage(options = {}) {
     const cachedListings = loadLocalListings();
     const syncState = loadLocalSyncState();
     const activeCachedListings = sortListingsByCreatedAtDesc(cachedListings);
-    const remoteMeta = await loadRemoteListingsMeta(firebase);
+    let remoteMeta = await loadRemoteListingsMeta(firebase);
     let listings = activeCachedListings;
     let source = "cache";
+
+    if (!remoteMeta) {
+      listings = [];
+      source = "page";
+    }
 
     if (remoteMeta && shouldUseCachedListings(syncState, remoteMeta) && hasEnoughListingsForPage(activeCachedListings, remoteMeta, requiredCount)) {
       return createListingPageResult(activeCachedListings, remoteMeta.activeCount, source, pageIndex, pageSize);
@@ -101,8 +106,9 @@ export async function loadListingPage(options = {}) {
       source = "page";
     }
 
-    if (!remoteMeta && syncState.cacheVersion === SYNC_CACHE_VERSION && activeCachedListings.length === 0 && syncState.initialized) {
-      return createListingPageResult(activeCachedListings, activeCachedListings.length, "cache-without-meta", pageIndex, pageSize);
+    if (remoteMeta && shouldUseCachedListings(syncState, remoteMeta) && !hasEnoughListingsForPage(listings, remoteMeta, requiredCount)) {
+      listings = [];
+      source = "page";
     }
 
     while (!hasEnoughListingsForPage(listings, remoteMeta, requiredCount)) {
@@ -119,6 +125,7 @@ export async function loadListingPage(options = {}) {
       if (nextListings.length < pageSize) break;
     }
 
+    remoteMeta = reconcileMetaForLoadedListings(remoteMeta, listings);
     saveLocalListings(listings, createListingsSyncState(listings, remoteMeta, syncState));
     return createListingPageResult(listings, remoteMeta?.activeCount, source, pageIndex, pageSize);
   } catch (error) {
@@ -281,9 +288,22 @@ function createListingPageResult(listings = [], totalCount = null, source = "unk
 
 function hasEnoughListingsForPage(listings = [], remoteMeta = null, requiredCount = DEFAULT_LISTINGS_PAGE_SIZE) {
   const activeListings = filterActiveListings(listings);
-  if (activeListings.length >= requiredCount) return true;
-  if (!remoteMeta || remoteMeta.activeCount == null || !Number.isFinite(Number(remoteMeta.activeCount))) return false;
-  return activeListings.length >= Number(remoteMeta.activeCount);
+  return activeListings.length >= requiredCount;
+}
+
+function reconcileMetaForLoadedListings(remoteMeta = null, listings = []) {
+  if (!remoteMeta || remoteMeta.activeCount == null || !Number.isFinite(Number(remoteMeta.activeCount))) return remoteMeta;
+
+  const activeCount = filterActiveListings(listings).length;
+  if (activeCount < Number(remoteMeta.activeCount)) {
+    return {
+      ...remoteMeta,
+      activeCount,
+      inconsistent: true,
+    };
+  }
+
+  return remoteMeta;
 }
 
 function getListingPageCursor(listings = []) {

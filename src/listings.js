@@ -219,7 +219,7 @@ function renderPagination(result = {}) {
   listingPagination.hidden = !shouldShow;
   if (!shouldShow) return;
 
-  listingPaginationSummary.textContent = `${paginationState.startItem.toLocaleString("ko-KR")}-${paginationState.endItem.toLocaleString("ko-KR")} / ${paginationState.totalCount.toLocaleString("ko-KR")}`;
+  listingPaginationSummary.textContent = `총 ${paginationState.totalCount.toLocaleString("ko-KR")}개 · ${paginationState.pageIndex + 1} / ${paginationState.totalPages}페이지`;
   previousListingsPageButton.disabled = paginationState.pageIndex <= 0 || Boolean(pageLoadInFlight);
   nextListingsPageButton.disabled = paginationState.pageIndex >= paginationState.totalPages - 1 || Boolean(pageLoadInFlight);
   renderPageButtons();
