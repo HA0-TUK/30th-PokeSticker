@@ -638,6 +638,38 @@ button.secondary:hover {
   min-width: 112px;
 }
 
+.pagination-controls,
+.page-buttons {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.pagination-controls {
+  justify-content: flex-end;
+}
+
+.pagination-controls button,
+.page-number {
+  min-width: 36px;
+  min-height: 36px;
+  padding: 0 10px;
+}
+
+.page-number.active {
+  border-color: var(--yellow);
+  background: var(--yellow);
+  color: #111827;
+}
+
+.page-ellipsis {
+  min-width: 22px;
+  color: var(--muted);
+  font-weight: 800;
+  text-align: center;
+}
+
 .listing-card {
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -1155,7 +1187,16 @@ button.secondary:hover {
     flex-direction: column;
   }
 
-  .pagination-bar button {
+  .pagination-controls {
+    justify-content: stretch;
+  }
+
+  .pagination-controls > button {
+    flex: 1;
+  }
+
+  .page-buttons {
+    justify-content: center;
     width: 100%;
   }
 

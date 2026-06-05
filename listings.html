@@ -32,7 +32,11 @@
         <div id="listingList" class="listing-list"></div>
         <div id="listingPagination" class="pagination-bar" hidden>
           <p id="listingPaginationSummary"></p>
-          <button id="loadMoreListingsButton" type="button" class="secondary">더 보기</button>
+          <div class="pagination-controls" aria-label="교환 글 페이지">
+            <button id="previousListingsPageButton" type="button" class="secondary">이전</button>
+            <div id="listingPageButtons" class="page-buttons"></div>
+            <button id="nextListingsPageButton" type="button" class="secondary">다음</button>
+          </div>
         </div>
       </section>
     </main>

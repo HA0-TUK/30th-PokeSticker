@@ -10,6 +10,7 @@ import {
   validateDraftForPublish,
 } from "./importer.js";
 import {
+  clearListingCache,
   getListingStoreMode,
   loadCachedListings,
   loadListings as loadStoredListings,
@@ -22,7 +23,7 @@ const TRAINER_KEY = "pokemon-market-trainer";
 const MAX_SOURCE_IMAGE_BYTES = 5 * 1024 * 1024;
 const STORED_IMAGE_TYPE = "image/webp";
 const STORED_IMAGE_QUALITY = 0.82;
-const MAX_USER_IMAGES = 10;
+const MAX_USER_IMAGES = 5;
 const REFERENCE_ASSET_ORIGIN = "public";
 const SHEET_WIDTH = 2200;
 const SHEET_HEIGHT = 1400;
@@ -121,6 +122,8 @@ async function parseInput() {
   try {
     currentImport = refreshImportedData(parseReferenceInput(elements.importInput.value, catalogIndex, { allowJson: false }));
     clearGeneratedImage();
+    clearListingCache();
+    listingsCache = [];
     saveProfile(currentImport);
     renderPreview(currentImport);
     renderGroupOptions();

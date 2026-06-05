@@ -15,7 +15,9 @@ const LISTINGS_REFRESH_THROTTLE_MS = 5000;
 const listingList = document.getElementById("listingList");
 const listingPagination = document.getElementById("listingPagination");
 const listingPaginationSummary = document.getElementById("listingPaginationSummary");
-const loadMoreListingsButton = document.getElementById("loadMoreListingsButton");
+const listingPageButtons = document.getElementById("listingPageButtons");
+const previousListingsPageButton = document.getElementById("previousListingsPageButton");
+const nextListingsPageButton = document.getElementById("nextListingsPageButton");
 const resetListingsButton = document.getElementById("resetListingsButton");
 const listingIntro = document.querySelector(".section-title p");
 const imageModal = document.getElementById("imageModal");
@@ -36,12 +38,14 @@ let activeCarousel = null;
 let carouselObserver = null;
 let autoRefreshInitialized = false;
 let refreshInFlight = null;
-let loadMoreInFlight = null;
+let pageLoadInFlight = null;
 let lastRefreshStartedAt = 0;
 let listingsBroadcastChannel = null;
 let paginationState = {
-  hasMore: false,
-  loadedCount: 0,
+  pageIndex: 0,
+  totalPages: 1,
+  startItem: 0,
+  endItem: 0,
   totalCount: 0,
 };
 const carouselStates = new WeakMap();
@@ -55,10 +59,16 @@ resetListingsButton.addEventListener("click", async () => {
   if (!window.confirm(message)) return;
 
   await deletePersonalListing();
-  await renderListings();
+  await renderListings(0);
 });
 
-loadMoreListingsButton.addEventListener("click", loadMoreListings);
+previousListingsPageButton.addEventListener("click", () => goToListingsPage(paginationState.pageIndex - 1));
+nextListingsPageButton.addEventListener("click", () => goToListingsPage(paginationState.pageIndex + 1));
+listingPageButtons.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-page-index]");
+  if (!button) return;
+  goToListingsPage(Number(button.dataset.pageIndex));
+});
 listingList.addEventListener("click", handleListingListClick);
 listingList.addEventListener("pointerdown", handleCarouselPointerDown);
 listingList.addEventListener("pointerup", handleCarouselPointerUp);
@@ -101,16 +111,17 @@ async function initializeListingsPage() {
       : "게시판에 접근할 수 없습니다.";
 
   if (listingStoreMode === "firebase") {
-    renderListingCards(sortListingsForProfile(loadCachedListings(), loadProfile()), { loading: true });
+    renderListingCards(sortListingsForProfile(loadCachedListings().slice(0, DEFAULT_LISTINGS_PAGE_SIZE), loadProfile()), { loading: true });
   }
 
-  await renderListings();
+  await renderListings(0);
   setupListingsAutoRefresh();
 }
 
-async function renderListings() {
+async function renderListings(pageIndex = paginationState.pageIndex || 0) {
   currentProfile = loadProfile();
   const result = await loadStoredListingPage({
+    pageIndex,
     pageSize: DEFAULT_LISTINGS_PAGE_SIZE,
   });
   const listings = sortListingsForProfile(result.listings, currentProfile);
@@ -118,29 +129,21 @@ async function renderListings() {
   renderPagination(result);
 }
 
-async function loadMoreListings() {
-  if (loadMoreInFlight || !paginationState.hasMore) return;
+async function goToListingsPage(pageIndex) {
+  if (pageLoadInFlight) return pageLoadInFlight;
+  if (!Number.isInteger(pageIndex)) return null;
+  if (pageIndex < 0 || pageIndex >= paginationState.totalPages) return null;
+  if (pageIndex === paginationState.pageIndex) return null;
 
-  loadMoreListingsButton.disabled = true;
-  loadMoreListingsButton.textContent = "불러오는 중";
-
-  loadMoreInFlight = loadStoredListingPage({
-    append: true,
-    pageSize: DEFAULT_LISTINGS_PAGE_SIZE,
-  })
-    .then((result) => {
-      currentProfile = loadProfile();
-      renderListingCards(sortListingsForProfile(result.listings, currentProfile));
-      renderPagination(result);
-    })
-    .catch((error) => console.warn("다음 교환 글을 불러오지 못했습니다.", error))
+  setPaginationBusy(true);
+  pageLoadInFlight = renderListings(pageIndex)
+    .catch((error) => console.warn("교환 글 페이지를 불러오지 못했습니다.", error))
     .finally(() => {
-      loadMoreInFlight = null;
-      loadMoreListingsButton.disabled = false;
-      if (!loadMoreListingsButton.hidden) loadMoreListingsButton.textContent = "더 보기";
+      pageLoadInFlight = null;
+      setPaginationBusy(false);
     });
 
-  return loadMoreInFlight;
+  return pageLoadInFlight;
 }
 
 function queueListingsRefresh(reason = "manual", options = {}) {
@@ -151,7 +154,7 @@ function queueListingsRefresh(reason = "manual", options = {}) {
   if (refreshInFlight) return refreshInFlight;
 
   lastRefreshStartedAt = now;
-  refreshInFlight = renderListings()
+  refreshInFlight = renderListings(paginationState.pageIndex || 0)
     .catch((error) => console.warn("교환 글 목록을 새로고침하지 못했습니다.", reason, error))
     .finally(() => {
       refreshInFlight = null;
@@ -164,7 +167,7 @@ function setupListingsAutoRefresh() {
   if (autoRefreshInitialized) return;
   autoRefreshInitialized = true;
 
-  window.addEventListener("focus", () => queueListingsRefresh("focus"), { immediate: true });
+  window.addEventListener("focus", () => queueListingsRefresh("focus", { immediate: true }));
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden) queueListingsRefresh("visible", { immediate: true });
   });
@@ -205,19 +208,80 @@ function renderListingCards(listings, options = {}) {
 
 function renderPagination(result = {}) {
   paginationState = {
-    hasMore: Boolean(result.hasMore),
-    loadedCount: Number(result.loadedCount || result.listings?.length || 0),
+    pageIndex: Number(result.pageIndex || 0),
+    totalPages: Math.max(1, Number(result.totalPages || 1)),
+    startItem: Number(result.startItem || 0),
+    endItem: Number(result.endItem || 0),
     totalCount: Number(result.totalCount || result.loadedCount || result.listings?.length || 0),
   };
 
-  const shouldShow = paginationState.loadedCount > 0 || paginationState.hasMore;
+  const shouldShow = paginationState.totalCount > 0;
   listingPagination.hidden = !shouldShow;
   if (!shouldShow) return;
 
-  listingPaginationSummary.textContent = `${paginationState.loadedCount.toLocaleString("ko-KR")} / ${paginationState.totalCount.toLocaleString("ko-KR")}`;
-  loadMoreListingsButton.hidden = !paginationState.hasMore;
-  loadMoreListingsButton.disabled = Boolean(loadMoreInFlight);
-  if (!loadMoreInFlight) loadMoreListingsButton.textContent = "더 보기";
+  listingPaginationSummary.textContent = `${paginationState.startItem.toLocaleString("ko-KR")}-${paginationState.endItem.toLocaleString("ko-KR")} / ${paginationState.totalCount.toLocaleString("ko-KR")}`;
+  previousListingsPageButton.disabled = paginationState.pageIndex <= 0 || Boolean(pageLoadInFlight);
+  nextListingsPageButton.disabled = paginationState.pageIndex >= paginationState.totalPages - 1 || Boolean(pageLoadInFlight);
+  renderPageButtons();
+}
+
+function renderPageButtons() {
+  listingPageButtons.innerHTML = "";
+
+  for (const item of createVisiblePageItems(paginationState.pageIndex, paginationState.totalPages)) {
+    if (item === "ellipsis") {
+      const ellipsis = document.createElement("span");
+      ellipsis.className = "page-ellipsis";
+      ellipsis.textContent = "…";
+      listingPageButtons.append(ellipsis);
+      continue;
+    }
+
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "page-number";
+    button.dataset.pageIndex = String(item);
+    button.textContent = String(item + 1);
+    button.disabled = Boolean(pageLoadInFlight);
+    button.classList.toggle("active", item === paginationState.pageIndex);
+    button.setAttribute("aria-current", item === paginationState.pageIndex ? "page" : "false");
+    listingPageButtons.append(button);
+  }
+}
+
+function createVisiblePageItems(currentPage, totalPages) {
+  if (totalPages <= 7) {
+    return Array.from({ length: totalPages }, (_, index) => index);
+  }
+
+  const pages = new Set([0, totalPages - 1]);
+  const start = Math.max(1, currentPage - 2);
+  const end = Math.min(totalPages - 2, currentPage + 2);
+
+  for (let index = start; index <= end; index += 1) {
+    pages.add(index);
+  }
+
+  const sortedPages = [...pages].sort((a, b) => a - b);
+  const items = [];
+
+  for (const page of sortedPages) {
+    const previous = items[items.length - 1];
+    if (typeof previous === "number" && page - previous > 1) {
+      items.push("ellipsis");
+    }
+    items.push(page);
+  }
+
+  return items;
+}
+
+function setPaginationBusy(isBusy) {
+  previousListingsPageButton.disabled = isBusy || paginationState.pageIndex <= 0;
+  nextListingsPageButton.disabled = isBusy || paginationState.pageIndex >= paginationState.totalPages - 1;
+  for (const button of listingPageButtons.querySelectorAll("button")) {
+    button.disabled = isBusy;
+  }
 }
 
 function createListingCard(listing) {
