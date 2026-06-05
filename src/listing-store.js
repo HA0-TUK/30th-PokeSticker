@@ -4,6 +4,8 @@ import { createListingOwnerKey, upsertPersonalListing } from "./importer.js";
 const FIREBASE_SDK_VERSION = "12.7.0";
 const LISTINGS_KEY = "pokemon-market-listings";
 const LISTINGS_SYNC_KEY = "pokemon-market-listings-sync";
+export const LISTINGS_REFRESH_KEY = "pokemon-market-listings-refresh";
+export const LISTINGS_BROADCAST_CHANNEL = "pokemon-market-listings";
 const LISTINGS_COLLECTION = "listings";
 const META_COLLECTION = "meta";
 const LISTINGS_META_DOCUMENT = "listings";
@@ -66,7 +68,7 @@ export async function syncListingsCache(firebase, cachedListings = [], syncState
     };
   }
 
-  if (!remoteMeta && syncState.cacheVersion === SYNC_CACHE_VERSION && (activeCachedListings.length > 0 || syncState.initialized)) {
+  if (!remoteMeta && syncState.cacheVersion === SYNC_CACHE_VERSION && activeCachedListings.length === 0 && syncState.initialized) {
     return {
       listings: activeCachedListings,
       syncState,
@@ -135,6 +137,7 @@ export async function savePersonalListing(draftListing, formData, options = {}) 
   if (!firebase) {
     const result = upsertPersonalListing(loadLocalListings(), draftListing, formData, options);
     saveLocalListings(result.listings);
+    announceListingsChanged({ action: result.action || "saved", listingId: result.listing?.id || "" });
     return result;
   }
 
@@ -172,6 +175,11 @@ export async function savePersonalListing(draftListing, formData, options = {}) 
   });
   const localListings = [listing, ...localResult.listings.filter((localListing) => localListing.id !== listing.id)];
   saveLocalListings(localListings, createListingsSyncState(localListings, null, loadLocalSyncState()));
+  announceListingsChanged({
+    action: existingIsActive ? "updated" : "created",
+    listingId: listing.id,
+    updatedAt: now,
+  });
 
   return {
     action: existingIsActive ? "updated" : "created",
@@ -186,6 +194,7 @@ export async function deletePersonalListing() {
   if (!firebase) {
     localStorage.removeItem(LISTINGS_KEY);
     localStorage.removeItem(LISTINGS_SYNC_KEY);
+    announceListingsChanged({ action: "deleted-local" });
     return;
   }
 
@@ -207,6 +216,46 @@ export async function deletePersonalListing() {
 
   const remaining = loadLocalListings().filter((listing) => listing.id !== user.uid && listing.ownerUid !== user.uid);
   saveLocalListings(remaining, createListingsSyncState(remaining, null, loadLocalSyncState()));
+  announceListingsChanged({
+    action: "deleted",
+    listingId: user.uid,
+    updatedAt: now,
+  });
+}
+
+function announceListingsChanged(detail = {}) {
+  const payload = {
+    type: "listings-changed",
+    action: detail.action || "changed",
+    listingId: detail.listingId || "",
+    updatedAt: detail.updatedAt || new Date().toISOString(),
+  };
+
+  try {
+    if (typeof localStorage !== "undefined") {
+      localStorage.setItem(LISTINGS_REFRESH_KEY, JSON.stringify(payload));
+    }
+  } catch {
+    // A private browsing mode or blocked storage should not break listing writes.
+  }
+
+  if (typeof BroadcastChannel !== "undefined") {
+    try {
+      const channel = new BroadcastChannel(LISTINGS_BROADCAST_CHANNEL);
+      channel.postMessage(payload);
+      channel.close();
+    } catch {
+      // Older browsers can rely on storage/focus refresh paths.
+    }
+  }
+
+  try {
+    if (typeof window !== "undefined" && typeof CustomEvent !== "undefined") {
+      window.dispatchEvent(new CustomEvent(LISTINGS_REFRESH_KEY, { detail: payload }));
+    }
+  } catch {
+    // Ignore local notification failures after the write has already succeeded.
+  }
 }
 
 async function getFirebaseState() {
@@ -505,7 +554,7 @@ async function loadRemoteListingChanges(firebase, lastSyncAt) {
   const snapshot = await firebase.getDocs(
     firebase.query(
       firebase.collection(firebase.db, LISTINGS_COLLECTION),
-      firebase.where("updatedAt", ">", lastSyncAt),
+      firebase.where("updatedAt", ">=", lastSyncAt),
     ),
   );
 

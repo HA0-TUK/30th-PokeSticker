@@ -2,11 +2,15 @@ import { sortListingsForProfile } from "./importer.js";
 import {
   deletePersonalListing,
   getListingStoreMode,
+  LISTINGS_BROADCAST_CHANNEL,
+  LISTINGS_REFRESH_KEY,
   loadCachedListings,
   loadListings as loadStoredListings,
 } from "./listing-store.js";
 
 const PROFILE_KEY = "pokemon-market-profile";
+const LISTINGS_AUTO_REFRESH_INTERVAL_MS = 45000;
+const LISTINGS_REFRESH_THROTTLE_MS = 5000;
 
 const listingList = document.getElementById("listingList");
 const resetListingsButton = document.getElementById("resetListingsButton");
@@ -27,6 +31,10 @@ let modalImages = [];
 let modalIndex = 0;
 let activeCarousel = null;
 let carouselObserver = null;
+let autoRefreshInitialized = false;
+let refreshInFlight = null;
+let lastRefreshStartedAt = 0;
+let listingsBroadcastChannel = null;
 const carouselStates = new WeakMap();
 const preloadedImageSources = new Set();
 
@@ -87,12 +95,59 @@ async function initializeListingsPage() {
   }
 
   await renderListings();
+  setupListingsAutoRefresh();
 }
 
 async function renderListings() {
   currentProfile = loadProfile();
   const listings = sortListingsForProfile(await loadStoredListings(), currentProfile);
   renderListingCards(listings);
+}
+
+function queueListingsRefresh(reason = "manual", options = {}) {
+  const now = Date.now();
+  if (!options.immediate && now - lastRefreshStartedAt < LISTINGS_REFRESH_THROTTLE_MS) {
+    return refreshInFlight;
+  }
+  if (refreshInFlight) return refreshInFlight;
+
+  lastRefreshStartedAt = now;
+  refreshInFlight = renderListings()
+    .catch((error) => console.warn("교환 글 목록을 새로고침하지 못했습니다.", reason, error))
+    .finally(() => {
+      refreshInFlight = null;
+    });
+
+  return refreshInFlight;
+}
+
+function setupListingsAutoRefresh() {
+  if (autoRefreshInitialized) return;
+  autoRefreshInitialized = true;
+
+  window.addEventListener("focus", () => queueListingsRefresh("focus"));
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) queueListingsRefresh("visible", { immediate: true });
+  });
+  window.addEventListener("storage", (event) => {
+    if (event.key === LISTINGS_REFRESH_KEY) queueListingsRefresh("storage", { immediate: true });
+  });
+  window.addEventListener(LISTINGS_REFRESH_KEY, () => queueListingsRefresh("local-event", { immediate: true }));
+
+  if (typeof BroadcastChannel !== "undefined") {
+    try {
+      listingsBroadcastChannel = new BroadcastChannel(LISTINGS_BROADCAST_CHANNEL);
+      listingsBroadcastChannel.addEventListener("message", () => {
+        queueListingsRefresh("broadcast", { immediate: true });
+      });
+    } catch {
+      listingsBroadcastChannel = null;
+    }
+  }
+
+  window.setInterval(() => {
+    if (!document.hidden) queueListingsRefresh("interval");
+  }, LISTINGS_AUTO_REFRESH_INTERVAL_MS);
 }
 
 function renderListingCards(listings, options = {}) {
