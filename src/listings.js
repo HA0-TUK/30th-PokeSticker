@@ -9,7 +9,6 @@ import {
 } from "./listing-store.js";
 
 const PROFILE_KEY = "pokemon-market-profile";
-const LISTINGS_AUTO_REFRESH_INTERVAL_MS = 45000;
 const LISTINGS_REFRESH_THROTTLE_MS = 5000;
 
 const listingList = document.getElementById("listingList");
@@ -144,10 +143,6 @@ function setupListingsAutoRefresh() {
       listingsBroadcastChannel = null;
     }
   }
-
-  window.setInterval(() => {
-    if (!document.hidden) queueListingsRefresh("interval");
-  }, LISTINGS_AUTO_REFRESH_INTERVAL_MS);
 }
 
 function renderListingCards(listings, options = {}) {

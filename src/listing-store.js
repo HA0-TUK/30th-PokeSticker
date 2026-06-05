@@ -4,13 +4,16 @@ import { createListingOwnerKey, upsertPersonalListing } from "./importer.js";
 const FIREBASE_SDK_VERSION = "12.7.0";
 const LISTINGS_KEY = "pokemon-market-listings";
 const LISTINGS_SYNC_KEY = "pokemon-market-listings-sync";
+const FIREBASE_UID_KEY = "pokemon-market-firebase-uid";
 export const LISTINGS_REFRESH_KEY = "pokemon-market-listings-refresh";
 export const LISTINGS_BROADCAST_CHANNEL = "pokemon-market-listings";
 const LISTINGS_COLLECTION = "listings";
+const DELETED_LISTINGS_COLLECTION = "deletedListings";
 const META_COLLECTION = "meta";
 const LISTINGS_META_DOCUMENT = "listings";
 const IMAGE_FOLDER = "listing-images";
 const SYNC_CACHE_VERSION = 3;
+const INCREMENTAL_SYNC_MAX_AGE_DAYS = 25;
 const STORAGE_CACHE_CONTROL = "public,max-age=31536000,immutable";
 
 let firebaseStatePromise = null;
@@ -58,8 +61,11 @@ export async function syncListingsCache(firebase, cachedListings = [], syncState
   }
 
   if (remoteMeta && canLoadIncrementalChanges(syncState)) {
-    const changedListings = await loadRemoteListingChanges(firebase, syncState.lastSyncAt);
-    const listings = mergeListingChanges(activeCachedListings, changedListings);
+    const [changedListings, deletedListings] = await Promise.all([
+      loadRemoteListingChanges(firebase, syncState.lastSyncAt),
+      loadRemoteDeletedListingChanges(firebase, syncState.lastSyncAt),
+    ]);
+    const listings = mergeListingChanges(activeCachedListings, changedListings, deletedListings);
 
     return {
       listings,
@@ -95,7 +101,7 @@ export function shouldUseCachedListings(syncState = {}, remoteMeta = null) {
   );
 }
 
-export function mergeListingChanges(cachedListings = [], changedListings = []) {
+export function mergeListingChanges(cachedListings = [], changedListings = [], deletedListings = []) {
   const byId = new Map();
 
   for (const listing of cachedListings || []) {
@@ -112,7 +118,26 @@ export function mergeListingChanges(cachedListings = [], changedListings = []) {
     }
   }
 
+  for (const deletion of deletedListings || []) {
+    const listingId = deletion?.listingId || deletion?.id;
+    if (!listingId) continue;
+    const current = byId.get(listingId);
+    if (!current || compareListingFreshness(current, deletion) <= 0) {
+      byId.delete(listingId);
+    }
+  }
+
   return [...byId.values()].filter((listing) => listing.active !== false);
+}
+
+function compareListingFreshness(listing, deletion) {
+  const listingTime = Date.parse(normalizeOptionalDateValue(listing?.updatedAt || listing?.createdAt));
+  const deletionTime = Date.parse(normalizeOptionalDateValue(deletion?.updatedAt || deletion?.deletedAt));
+
+  if (Number.isNaN(deletionTime)) return 1;
+  if (Number.isNaN(listingTime)) return -1;
+  if (listingTime === deletionTime) return 0;
+  return listingTime > deletionTime ? 1 : -1;
 }
 
 export function createListingsSyncState(listings = [], remoteMeta = null, previousState = {}) {
@@ -143,6 +168,8 @@ export async function savePersonalListing(draftListing, formData, options = {}) 
 
   const user = firebase.auth.currentUser || (await firebase.signInAnonymously(firebase.auth)).user;
   const listingRef = firebase.doc(firebase.db, LISTINGS_COLLECTION, user.uid);
+  
+  // 최신 상태 확인 필요: 이미지 diff 계산, 중복 저장 방지
   const existingSnapshot = await firebase.getDoc(listingRef);
   const existing = existingSnapshot.exists() ? normalizeRemoteListing(existingSnapshot.id, existingSnapshot.data()) : null;
   const existingIsActive = Boolean(existing && existing.active !== false);
@@ -200,18 +227,22 @@ export async function deletePersonalListing() {
 
   const user = firebase.auth.currentUser || (await firebase.signInAnonymously(firebase.auth)).user;
   const listingRef = firebase.doc(firebase.db, LISTINGS_COLLECTION, user.uid);
+  const deletionRef = firebase.doc(firebase.db, DELETED_LISTINGS_COLLECTION, user.uid);
   const existingSnapshot = await firebase.getDoc(listingRef);
   const existing = existingSnapshot.exists() ? normalizeRemoteListing(existingSnapshot.id, existingSnapshot.data()) : null;
   const now = new Date().toISOString();
 
   if (existing && existing.active !== false) {
-    await writeListingAndMeta(firebase, listingRef, {
-      ...existing,
-      active: false,
+    const storagePaths = collectStoragePaths(existing.images);
+    await writeListingDeletionAndMeta(firebase, listingRef, deletionRef, {
+      listingId: user.uid,
+      ownerUid: user.uid,
       deletedAt: now,
       updatedAt: now,
-    }, -1, now);
-    await deleteStoragePaths(firebase, collectStoragePaths(existing.images));
+      storagePaths,
+      storageBytes: sumImageSizes(existing.images),
+    }, now);
+    await deleteStoragePaths(firebase, storagePaths);
   }
 
   const remaining = loadLocalListings().filter((listing) => listing.id !== user.uid && listing.ownerUid !== user.uid);
@@ -325,6 +356,19 @@ async function initializeFirebaseState() {
     await authModule.signInAnonymously(auth);
   }
 
+  // UID를 로컬 스토리지에 저장하여 세션 간 일관성 유지
+  const currentUser = auth.currentUser;
+  if (currentUser) {
+    const savedUid = localStorage.getItem(FIREBASE_UID_KEY);
+    if (!savedUid) {
+      localStorage.setItem(FIREBASE_UID_KEY, currentUser.uid);
+      console.log("Firebase UID 저장됨:", currentUser.uid);
+    } else if (savedUid !== currentUser.uid) {
+      console.warn("저장된 UID와 현재 UID가 다릅니다. 저장된 UID를 우선 사용해야 합니다.");
+      console.warn("저장된 UID:", savedUid, "현재 UID:", currentUser.uid);
+    }
+  }
+
   return {
     auth,
     db,
@@ -352,19 +396,23 @@ function getFirebaseApp(appModule) {
 }
 
 async function prepareRemoteImages(firebase, ownerUid, images) {
+  const uploadBatchId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
   const prepared = await Promise.all(
-    (images || []).filter(Boolean).map((image, index) => prepareRemoteImage(firebase, ownerUid, image, index)),
+    (images || []).filter(Boolean).map((image, index) => prepareRemoteImage(firebase, ownerUid, image, index, uploadBatchId)),
   );
 
   return prepared.filter(Boolean);
 }
 
-async function prepareRemoteImage(firebase, ownerUid, image, index = 0) {
+async function prepareRemoteImage(firebase, ownerUid, image, index = 0, uploadBatchId = "default") {
   if (!image) return null;
   if (image.url) return createStoredImageMetadata(image, index);
   if (!image.dataUrl) return null;
 
-  const imageRef = firebase.ref(firebase.storage, `${IMAGE_FOLDER}/${ownerUid}/${String(index).padStart(2, "0")}-${sanitizeImageName(image.name || "attachment")}`);
+  const imageRef = firebase.ref(
+    firebase.storage,
+    `${IMAGE_FOLDER}/${ownerUid}/${uploadBatchId}/${String(index).padStart(2, "0")}-${sanitizeImageName(image.name || "attachment")}`,
+  );
   await firebase.uploadString(imageRef, image.dataUrl, "data_url", {
     contentType: image.type || "image/png",
     cacheControl: STORAGE_CACHE_CONTROL,
@@ -382,10 +430,6 @@ async function prepareRemoteImage(firebase, ownerUid, image, index = 0) {
     size: image.size || null,
     width: Number.isFinite(Number(image.width)) ? Number(image.width) : null,
     height: Number.isFinite(Number(image.height)) ? Number(image.height) : null,
-    thumbnailUrl: "",
-    thumbnailStoragePath: "",
-    thumbnailSize: null,
-    thumbnailType: "",
     order: index,
   };
 }
@@ -403,83 +447,8 @@ function createStoredImageMetadata(image, index = 0) {
     size: image.size || image.originalSize || null,
     width: Number.isFinite(Number(image.width)) ? Number(image.width) : null,
     height: Number.isFinite(Number(image.height)) ? Number(image.height) : null,
-    thumbnailUrl: "",
-    thumbnailStoragePath: "",
-    thumbnailSize: null,
-    thumbnailType: "",
     order: Number.isFinite(Number(image.order)) ? Number(image.order) : index,
   };
-}
-
-async function prepareRemoteThumbnail(firebase, ownerUid, image, index = 0) {
-  const thumbnail = await createImageThumbnail(image);
-  if (!thumbnail) return null;
-
-  try {
-    const baseName = removeFileExtension(image.name || "attachment");
-    const thumbnailRef = firebase.ref(
-      firebase.storage,
-      `${IMAGE_FOLDER}/${ownerUid}/thumb-${String(index).padStart(2, "0")}-${sanitizeImageName(baseName)}.webp`,
-    );
-
-    await firebase.uploadString(thumbnailRef, thumbnail.dataUrl, "data_url", {
-      contentType: thumbnail.type,
-      cacheControl: STORAGE_CACHE_CONTROL,
-    });
-
-    return {
-      url: await firebase.getDownloadURL(thumbnailRef),
-      storagePath: thumbnailRef.fullPath,
-      size: thumbnail.size,
-      type: thumbnail.type,
-    };
-  } catch (error) {
-    console.warn("목록 썸네일을 업로드하지 못해 원본 이미지를 사용합니다.", error);
-    return null;
-  }
-}
-
-async function createImageThumbnail(image) {
-  if (!image?.dataUrl || typeof document === "undefined") return null;
-
-  try {
-    const source = await loadImageForThumbnail(image.dataUrl);
-    const width = source.naturalWidth || source.width;
-    const height = source.naturalHeight || source.height;
-    const longestSide = Math.max(width, height);
-    if (!longestSide) return null;
-
-    const scale = Math.min(1, THUMBNAIL_MAX_DIMENSION / longestSide);
-    const canvas = document.createElement("canvas");
-    canvas.width = Math.max(1, Math.round(width * scale));
-    canvas.height = Math.max(1, Math.round(height * scale));
-
-    const context = canvas.getContext("2d");
-    context.drawImage(source, 0, 0, canvas.width, canvas.height);
-
-    const blob = await canvasToBlob(canvas, "image/webp", THUMBNAIL_QUALITY)
-      || await canvasToBlob(canvas, "image/jpeg", 0.78);
-    if (!blob) return null;
-
-    return {
-      dataUrl: await blobToDataUrl(blob),
-      size: blob.size,
-      type: blob.type || "image/webp",
-    };
-  } catch (error) {
-    console.warn("목록 썸네일을 만들지 못해 원본 이미지를 사용합니다.", error);
-    return null;
-  }
-}
-
-function loadImageForThumbnail(src) {
-  return new Promise((resolve, reject) => {
-    const image = new Image();
-    image.decoding = "async";
-    image.onload = () => resolve(image);
-    image.onerror = () => reject(new Error("이미지를 썸네일로 변환하지 못했습니다."));
-    image.src = src;
-  });
 }
 
 function canvasToBlob(canvas, type, quality) {
@@ -524,18 +493,45 @@ function collectStoragePaths(images = []) {
   return (images || []).flatMap(collectImageStoragePaths);
 }
 
+function sumImageSizes(images = []) {
+  return (images || []).reduce((sum, image) => {
+    const size = Number(image?.size || image?.originalSize || 0);
+    return Number.isFinite(size) && size > 0 ? sum + size : sum;
+  }, 0);
+}
+
 function collectImageStoragePaths(image) {
-  return [image?.storagePath, image?.thumbnailStoragePath].filter(Boolean);
+  const paths = [];
+  // storagePath가 있으면 추가
+  if (image?.storagePath) {
+    paths.push(image.storagePath);
+  }
+  return paths;
 }
 
 async function deleteStoragePaths(firebase, storagePaths) {
-  await Promise.all((storagePaths || []).map(async (storagePath) => {
+  const results = await Promise.allSettled((storagePaths || []).map(async (storagePath) => {
     try {
       await firebase.deleteObject(firebase.ref(firebase.storage, storagePath));
+      console.log(`Storage 파일 삭제 완료: ${storagePath}`);
+      return { success: true, path: storagePath };
     } catch (error) {
-      console.warn("이전 첨부 이미지를 삭제하지 못했습니다.", storagePath, error);
+      console.warn(`Storage 파일 삭제 실패: ${storagePath}`, error.code, error.message);
+      return { success: false, path: storagePath, error: error.message };
     }
   }));
+
+  // 삭제 결과 요약 로깅
+  const successCount = results.filter(r => r.status === 'fulfilled' && r.value?.success).length;
+  const failureCount = results.filter(r => r.status === 'fulfilled' && !r.value?.success).length;
+  
+  if (failureCount > 0) {
+    console.warn(`Storage 파일 삭제: ${successCount}개 성공, ${failureCount}개 실패`);
+    const failed = results
+      .filter(r => r.status === 'fulfilled' && !r.value?.success)
+      .map(r => r.value.path);
+    console.warn("삭제 실패 파일:", failed);
+  }
 }
 
 async function loadRemoteListingsMeta(firebase) {
@@ -561,6 +557,17 @@ async function loadRemoteListingChanges(firebase, lastSyncAt) {
   return snapshot.docs.map((document) => normalizeRemoteListing(document.id, document.data()));
 }
 
+async function loadRemoteDeletedListingChanges(firebase, lastSyncAt) {
+  const snapshot = await firebase.getDocs(
+    firebase.query(
+      firebase.collection(firebase.db, DELETED_LISTINGS_COLLECTION),
+      firebase.where("updatedAt", ">=", lastSyncAt),
+    ),
+  );
+
+  return snapshot.docs.map((document) => normalizeRemoteDeletedListing(document.id, document.data()));
+}
+
 async function writeListingAndMeta(firebase, listingRef, listing, activeCountDelta, updatedAt) {
   const metaRef = firebase.doc(firebase.db, META_COLLECTION, LISTINGS_META_DOCUMENT);
   const metaPatch = {
@@ -584,6 +591,28 @@ async function writeListingAndMeta(firebase, listingRef, listing, activeCountDel
   await firebase.setDoc(metaRef, metaPatch, { merge: true });
 }
 
+async function writeListingDeletionAndMeta(firebase, listingRef, deletionRef, deletion, updatedAt) {
+  const metaRef = firebase.doc(firebase.db, META_COLLECTION, LISTINGS_META_DOCUMENT);
+  const metaPatch = {
+    revision: firebase.increment(1),
+    updatedAt,
+    activeCount: firebase.increment(-1),
+  };
+
+  if (firebase.writeBatch) {
+    const batch = firebase.writeBatch(firebase.db);
+    batch.delete(listingRef);
+    batch.set(deletionRef, deletion, { merge: true });
+    batch.set(metaRef, metaPatch, { merge: true });
+    await batch.commit();
+    return;
+  }
+
+  await firebase.deleteDoc(listingRef);
+  await firebase.setDoc(deletionRef, deletion, { merge: true });
+  await firebase.setDoc(metaRef, metaPatch, { merge: true });
+}
+
 function normalizeRemoteListing(id, data) {
   const images = Array.isArray(data?.images) ? data.images : data?.image ? [data.image] : [];
 
@@ -596,6 +625,16 @@ function normalizeRemoteListing(id, data) {
     createdAt: normalizeDateValue(data?.createdAt),
     updatedAt: data?.updatedAt ? normalizeDateValue(data.updatedAt) : null,
     deletedAt: data?.deletedAt ? normalizeDateValue(data.deletedAt) : null,
+  };
+}
+
+function normalizeRemoteDeletedListing(id, data) {
+  return {
+    id,
+    listingId: data?.listingId || id,
+    ownerUid: data?.ownerUid || "",
+    deletedAt: normalizeOptionalDateValue(data?.deletedAt),
+    updatedAt: normalizeOptionalDateValue(data?.updatedAt || data?.deletedAt),
   };
 }
 
@@ -664,7 +703,12 @@ function filterActiveListings(listings = []) {
 }
 
 function canLoadIncrementalChanges(syncState = {}) {
-  return Boolean(syncState.initialized && syncState.cacheVersion === SYNC_CACHE_VERSION && syncState.lastSyncAt);
+  if (!syncState.initialized || syncState.cacheVersion !== SYNC_CACHE_VERSION || !syncState.lastSyncAt) return false;
+
+  const lastSyncTime = Date.parse(syncState.lastSyncAt);
+  if (Number.isNaN(lastSyncTime)) return false;
+
+  return Date.now() - lastSyncTime <= INCREMENTAL_SYNC_MAX_AGE_DAYS * 24 * 60 * 60 * 1000;
 }
 
 function getMaxListingUpdatedAt(listings = []) {
