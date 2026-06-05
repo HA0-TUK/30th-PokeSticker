@@ -11,7 +11,9 @@ import {
 } from "./importer.js";
 import {
   getListingStoreMode,
+  loadCachedListings,
   loadListings as loadStoredListings,
+  loadPersonalListing,
   savePersonalListing,
 } from "./listing-store.js";
 
@@ -96,7 +98,15 @@ if (loadProfile()) {
 
 async function initializeListingStore() {
   listingStoreMode = await getListingStoreMode();
-  listingsCache = await loadStoredListings();
+  if (listingStoreMode === "firebase") {
+    listingsCache = loadCachedListings();
+    const personalListing = await loadPersonalListing();
+    if (personalListing) {
+      listingsCache = [personalListing, ...listingsCache.filter((listing) => listing.id !== personalListing.id)];
+    }
+  } else {
+    listingsCache = await loadStoredListings();
+  }
   updatePublishAvailability();
 
   if (listingStoreMode === "firebase" && !elements.importMessage.textContent) {

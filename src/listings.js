@@ -1,17 +1,21 @@
 import { sortListingsForProfile } from "./importer.js";
 import {
+  DEFAULT_LISTINGS_PAGE_SIZE,
   deletePersonalListing,
   getListingStoreMode,
   LISTINGS_BROADCAST_CHANNEL,
   LISTINGS_REFRESH_KEY,
   loadCachedListings,
-  loadListings as loadStoredListings,
+  loadListingPage as loadStoredListingPage,
 } from "./listing-store.js";
 
 const PROFILE_KEY = "pokemon-market-profile";
 const LISTINGS_REFRESH_THROTTLE_MS = 5000;
 
 const listingList = document.getElementById("listingList");
+const listingPagination = document.getElementById("listingPagination");
+const listingPaginationSummary = document.getElementById("listingPaginationSummary");
+const loadMoreListingsButton = document.getElementById("loadMoreListingsButton");
 const resetListingsButton = document.getElementById("resetListingsButton");
 const listingIntro = document.querySelector(".section-title p");
 const imageModal = document.getElementById("imageModal");
@@ -32,8 +36,14 @@ let activeCarousel = null;
 let carouselObserver = null;
 let autoRefreshInitialized = false;
 let refreshInFlight = null;
+let loadMoreInFlight = null;
 let lastRefreshStartedAt = 0;
 let listingsBroadcastChannel = null;
+let paginationState = {
+  hasMore: false,
+  loadedCount: 0,
+  totalCount: 0,
+};
 const carouselStates = new WeakMap();
 const preloadedImageSources = new Set();
 
@@ -48,6 +58,7 @@ resetListingsButton.addEventListener("click", async () => {
   await renderListings();
 });
 
+loadMoreListingsButton.addEventListener("click", loadMoreListings);
 listingList.addEventListener("click", handleListingListClick);
 listingList.addEventListener("pointerdown", handleCarouselPointerDown);
 listingList.addEventListener("pointerup", handleCarouselPointerUp);
@@ -86,7 +97,7 @@ async function initializeListingsPage() {
   resetListingsButton.textContent = listingStoreMode === "firebase" ? "내 교환 글 삭제" : "교환 글 비우기";
   listingIntro.textContent =
     listingStoreMode === "firebase"
-      ? "현재 교환을 찾고 있는 교환 글입니다. 마이페이지 기준으로 교환 가능성이 높은 글부터 정렬됩니다."
+      ? "현재 교환을 찾고 있는 교환 글입니다."
       : "게시판에 접근할 수 없습니다.";
 
   if (listingStoreMode === "firebase") {
@@ -99,8 +110,37 @@ async function initializeListingsPage() {
 
 async function renderListings() {
   currentProfile = loadProfile();
-  const listings = sortListingsForProfile(await loadStoredListings(), currentProfile);
+  const result = await loadStoredListingPage({
+    pageSize: DEFAULT_LISTINGS_PAGE_SIZE,
+  });
+  const listings = sortListingsForProfile(result.listings, currentProfile);
   renderListingCards(listings);
+  renderPagination(result);
+}
+
+async function loadMoreListings() {
+  if (loadMoreInFlight || !paginationState.hasMore) return;
+
+  loadMoreListingsButton.disabled = true;
+  loadMoreListingsButton.textContent = "불러오는 중";
+
+  loadMoreInFlight = loadStoredListingPage({
+    append: true,
+    pageSize: DEFAULT_LISTINGS_PAGE_SIZE,
+  })
+    .then((result) => {
+      currentProfile = loadProfile();
+      renderListingCards(sortListingsForProfile(result.listings, currentProfile));
+      renderPagination(result);
+    })
+    .catch((error) => console.warn("다음 교환 글을 불러오지 못했습니다.", error))
+    .finally(() => {
+      loadMoreInFlight = null;
+      loadMoreListingsButton.disabled = false;
+      if (!loadMoreListingsButton.hidden) loadMoreListingsButton.textContent = "더 보기";
+    });
+
+  return loadMoreInFlight;
 }
 
 function queueListingsRefresh(reason = "manual", options = {}) {
@@ -124,7 +164,7 @@ function setupListingsAutoRefresh() {
   if (autoRefreshInitialized) return;
   autoRefreshInitialized = true;
 
-  window.addEventListener("focus", () => queueListingsRefresh("focus"));
+  window.addEventListener("focus", () => queueListingsRefresh("focus"), { immediate: true });
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden) queueListingsRefresh("visible", { immediate: true });
   });
@@ -161,6 +201,23 @@ function renderListingCards(listings, options = {}) {
   for (const listing of listings) {
     listingList.append(createListingCard(listing));
   }
+}
+
+function renderPagination(result = {}) {
+  paginationState = {
+    hasMore: Boolean(result.hasMore),
+    loadedCount: Number(result.loadedCount || result.listings?.length || 0),
+    totalCount: Number(result.totalCount || result.loadedCount || result.listings?.length || 0),
+  };
+
+  const shouldShow = paginationState.loadedCount > 0 || paginationState.hasMore;
+  listingPagination.hidden = !shouldShow;
+  if (!shouldShow) return;
+
+  listingPaginationSummary.textContent = `${paginationState.loadedCount.toLocaleString("ko-KR")} / ${paginationState.totalCount.toLocaleString("ko-KR")}`;
+  loadMoreListingsButton.hidden = !paginationState.hasMore;
+  loadMoreListingsButton.disabled = Boolean(loadMoreInFlight);
+  if (!loadMoreInFlight) loadMoreListingsButton.textContent = "더 보기";
 }
 
 function createListingCard(listing) {

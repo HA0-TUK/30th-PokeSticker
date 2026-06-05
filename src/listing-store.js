@@ -14,6 +14,7 @@ const LISTINGS_META_DOCUMENT = "listings";
 const IMAGE_FOLDER = "listing-images";
 const SYNC_CACHE_VERSION = 3;
 const INCREMENTAL_SYNC_MAX_AGE_DAYS = 25;
+export const DEFAULT_LISTINGS_PAGE_SIZE = 50;
 const STORAGE_CACHE_CONTROL = "public,max-age=31536000,immutable";
 
 let firebaseStatePromise = null;
@@ -45,6 +46,95 @@ export async function loadListings() {
 export function loadCachedListings() {
   if (loadLocalSyncState().cacheVersion !== SYNC_CACHE_VERSION) return [];
   return loadLocalListings();
+}
+
+export async function loadListingPage(options = {}) {
+  const pageSize = Number.isFinite(Number(options.pageSize)) && Number(options.pageSize) > 0
+    ? Number(options.pageSize)
+    : DEFAULT_LISTINGS_PAGE_SIZE;
+  const firebase = await getFirebaseReadState();
+
+  if (!firebase) {
+    const listings = loadLocalListings();
+    return createListingPageResult(listings, listings.length, false, "local");
+  }
+
+  try {
+    const cachedListings = loadLocalListings();
+    const syncState = loadLocalSyncState();
+    const activeCachedListings = filterActiveListings(cachedListings);
+    const remoteMeta = await loadRemoteListingsMeta(firebase);
+
+    if (!options.append && remoteMeta && shouldUseCachedListings(syncState, remoteMeta) && activeCachedListings.length > 0) {
+      return createListingPageResult(activeCachedListings, remoteMeta.activeCount, hasMoreCachedListings(activeCachedListings, remoteMeta), "cache");
+    }
+
+    if (!options.append && remoteMeta && canLoadIncrementalChanges(syncState) && activeCachedListings.length > 0) {
+      const [changedListings, deletedListings] = await Promise.all([
+        loadRemoteListingChanges(firebase, syncState.lastSyncAt),
+        loadRemoteDeletedListingChanges(firebase, syncState.lastSyncAt),
+      ]);
+      const listings = mergeListingChanges(activeCachedListings, changedListings, deletedListings);
+      saveLocalListings(listings, createListingsSyncState(listings, remoteMeta, syncState));
+      return createListingPageResult(listings, remoteMeta.activeCount, hasMoreCachedListings(listings, remoteMeta), "incremental");
+    }
+
+    if (!options.append && !remoteMeta && syncState.cacheVersion === SYNC_CACHE_VERSION && activeCachedListings.length === 0 && syncState.initialized) {
+      return createListingPageResult(activeCachedListings, activeCachedListings.length, false, "cache-without-meta");
+    }
+
+    const cursor = options.append ? getListingPageCursor(activeCachedListings) : "";
+    const nextListings = await loadRemoteListingPage(firebase, {
+      cursor,
+      pageSize,
+    });
+    const listings = options.append
+      ? mergeListingChanges(activeCachedListings, nextListings)
+      : nextListings;
+    const sortedListings = sortListingsByCreatedAtDesc(listings);
+    saveLocalListings(sortedListings, createListingsSyncState(sortedListings, remoteMeta, syncState));
+
+    return createListingPageResult(
+      sortedListings,
+      remoteMeta?.activeCount,
+      nextListings.length >= pageSize && hasMoreCachedListings(sortedListings, remoteMeta),
+      options.append ? "page-append" : "page",
+    );
+  } catch (error) {
+    console.warn("Firebase 페이지 목록을 불러오지 못해 로컬 캐시를 사용합니다.", error);
+    const listings = loadLocalListings();
+    return createListingPageResult(listings, listings.length, false, "cache-fallback");
+  }
+}
+
+export async function loadPersonalListing() {
+  const firebase = await getFirebaseState();
+  if (!firebase) return null;
+
+  try {
+    const user = firebase.auth.currentUser || (await firebase.signInAnonymously(firebase.auth)).user;
+    const listingRef = firebase.doc(firebase.db, LISTINGS_COLLECTION, user.uid);
+    const snapshot = await firebase.getDoc(listingRef);
+    const localListings = loadLocalListings();
+    const remaining = localListings.filter((listing) => listing.id !== user.uid && listing.ownerUid !== user.uid);
+
+    if (!snapshot.exists()) {
+      saveLocalListings(remaining, loadLocalSyncState());
+      return null;
+    }
+
+    const listing = normalizeRemoteListing(snapshot.id, snapshot.data());
+    if (listing.active === false) {
+      saveLocalListings(remaining, loadLocalSyncState());
+      return null;
+    }
+
+    saveLocalListings([listing, ...remaining], loadLocalSyncState());
+    return listing;
+  } catch (error) {
+    console.warn("내 교환 글을 불러오지 못했습니다.", error);
+    return null;
+  }
 }
 
 export async function syncListingsCache(firebase, cachedListings = [], syncState = {}) {
@@ -138,6 +228,45 @@ function compareListingFreshness(listing, deletion) {
   if (Number.isNaN(listingTime)) return -1;
   if (listingTime === deletionTime) return 0;
   return listingTime > deletionTime ? 1 : -1;
+}
+
+function createListingPageResult(listings = [], totalCount = null, hasMore = false, source = "unknown") {
+  const activeListings = filterActiveListings(listings);
+  const normalizedTotalCount = totalCount != null && Number.isFinite(Number(totalCount))
+    ? Number(totalCount)
+    : activeListings.length;
+  const displayTotalCount = Math.max(activeListings.length, normalizedTotalCount);
+
+  return {
+    listings: activeListings,
+    loadedCount: activeListings.length,
+    totalCount: displayTotalCount,
+    hasMore: Boolean(hasMore && activeListings.length < displayTotalCount),
+    source,
+  };
+}
+
+function hasMoreCachedListings(listings = [], remoteMeta = null) {
+  if (!remoteMeta || remoteMeta.activeCount == null || !Number.isFinite(Number(remoteMeta.activeCount))) return false;
+  return filterActiveListings(listings).length < Number(remoteMeta.activeCount);
+}
+
+function getListingPageCursor(listings = []) {
+  const sortedListings = sortListingsByCreatedAtDesc(listings);
+  const lastListing = sortedListings[sortedListings.length - 1];
+  return normalizeOptionalDateValue(lastListing?.createdAt);
+}
+
+function sortListingsByCreatedAtDesc(listings = []) {
+  return [...filterActiveListings(listings)].sort((a, b) => {
+    const aTime = Date.parse(normalizeOptionalDateValue(a?.createdAt));
+    const bTime = Date.parse(normalizeOptionalDateValue(b?.createdAt));
+    if (Number.isNaN(aTime) && Number.isNaN(bTime)) return String(a?.id || "").localeCompare(String(b?.id || ""));
+    if (Number.isNaN(aTime)) return 1;
+    if (Number.isNaN(bTime)) return -1;
+    if (aTime === bTime) return String(a?.id || "").localeCompare(String(b?.id || ""));
+    return bTime - aTime;
+  });
 }
 
 export function createListingsSyncState(listings = [], remoteMeta = null, previousState = {}) {
@@ -329,7 +458,10 @@ async function initializeFirebaseReadState() {
     doc: firestoreModule.doc,
     getDoc: firestoreModule.getDoc,
     getDocs: firestoreModule.getDocs,
+    limit: firestoreModule.limit,
+    orderBy: firestoreModule.orderBy,
     query: firestoreModule.query,
+    startAfter: firestoreModule.startAfter,
     where: firestoreModule.where,
   };
 }
@@ -555,6 +687,26 @@ async function loadRemoteListingChanges(firebase, lastSyncAt) {
   );
 
   return snapshot.docs.map((document) => normalizeRemoteListing(document.id, document.data()));
+}
+
+async function loadRemoteListingPage(firebase, options = {}) {
+  const clauses = [
+    firebase.orderBy("createdAt", "desc"),
+  ];
+
+  if (options.cursor) clauses.push(firebase.startAfter(options.cursor));
+  clauses.push(firebase.limit(options.pageSize || DEFAULT_LISTINGS_PAGE_SIZE));
+
+  const snapshot = await firebase.getDocs(
+    firebase.query(
+      firebase.collection(firebase.db, LISTINGS_COLLECTION),
+      ...clauses,
+    ),
+  );
+
+  return snapshot.docs
+    .map((document) => normalizeRemoteListing(document.id, document.data()))
+    .filter((listing) => listing.active !== false);
 }
 
 async function loadRemoteDeletedListingChanges(firebase, lastSyncAt) {
