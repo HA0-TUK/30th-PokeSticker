@@ -9,7 +9,7 @@
     <link rel="manifest" href="./site.webmanifest?v=favicon-20260606-1">
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>마이페이지 | 포켓몬 스티커 교환 장터</title>
-    <link rel="stylesheet" href="./styles.css?v=meta-repair-20260606-1" />
+    <link rel="stylesheet" href="./styles.css?v=share-split-20260607-1" />
   </head>
   <body>
     <header class="app-header">
@@ -67,7 +67,10 @@
                 <input id="imageInput" type="file" accept="image/*" multiple />
               </label>
               <div id="imagePreview" class="image-preview hidden"></div>
-              <button id="publishButton" type="button" disabled>게시</button>
+              <div class="publish-actions">
+                <button id="publishButton" type="button" disabled>게시</button>
+                <button id="shareMyListingButton" type="button" class="secondary" disabled>내 교환 글 공유</button>
+              </div>
             </div>
             <p id="publishMessage" class="message" role="status"></p>
           </section>
@@ -100,7 +103,10 @@
             <div class="section-title">
               <div>
                 <h2>목록 직접 수정</h2>
-                <p>공유 코드가 없어도 원하는 목록을 선택해 스티커를 추가하거나, 목록의 스티커를 눌러 제거할 수 있습니다.</p>
+                <p>공유 코드가 없어도 원하는 목록을 선택해 스티커를 추가하거나, 목록의 스티커를 눌러 제거할 수 있습니다. 
+
+                  비어있는 항목은 칸 구분이 자동으로 사라집니다. (보유중의 1번칸만 채울 시 오른쪽 영역이 통째로 1칸이 됩니다.)
+                </p>
               </div>
             </div>
 
@@ -134,7 +140,7 @@
             <div class="trainer-fields">
               <label class="field">
                 <span>닉네임</span>
-                <input id="nickname" type="text" maxlength="30" placeholder="예: 레드" required />
+                <input id="nickname" type="text" maxlength="30" placeholder="예: 한지우" required />
               </label>
               <label class="field">
                 <span>오픈채팅 / 연락처</span>
@@ -150,6 +156,6 @@
       </form>
     </main>
 
-    <script type="module" src="./src/app.js?v=meta-repair-20260606-1"></script>
+    <script type="module" src="./src/app.js?v=share-split-20260607-1"></script>
   </body>
 </html>

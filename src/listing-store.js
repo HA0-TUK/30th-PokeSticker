@@ -125,7 +125,6 @@ export async function loadListingPage(options = {}) {
       if (nextListings.length < pageSize) break;
     }
 
-    remoteMeta = reconcileMetaForLoadedListings(remoteMeta, listings);
     saveLocalListings(listings, createListingsSyncState(listings, remoteMeta, syncState));
     return createListingPageResult(listings, remoteMeta?.activeCount, source, pageIndex, pageSize);
   } catch (error) {
@@ -161,6 +160,41 @@ export async function loadPersonalListing() {
     return listing;
   } catch (error) {
     console.warn("내 교환 글을 불러오지 못했습니다.", error);
+    return null;
+  }
+}
+
+export async function resolveListingShareTarget(listingId, pageSize = DEFAULT_LISTINGS_PAGE_SIZE) {
+  const normalizedListingId = normalizeListingId(listingId);
+  if (!normalizedListingId) return null;
+
+  const firebase = await getFirebaseReadState();
+  const safePageSize = Number.isFinite(Number(pageSize)) && Number(pageSize) > 0
+    ? Number(pageSize)
+    : DEFAULT_LISTINGS_PAGE_SIZE;
+
+  if (!firebase) {
+    const listings = sortListingsByCreatedAtDesc(loadLocalListings());
+    const index = listings.findIndex((listing) => listing.id === normalizedListingId);
+    if (index < 0) return null;
+
+    return {
+      listing: listings[index],
+      pageIndex: Math.floor(index / safePageSize),
+    };
+  }
+
+  try {
+    const listing = await loadRemoteListingById(firebase, normalizedListingId);
+    if (!listing) return null;
+
+    const newerCount = await countRemoteListingsNewerThan(firebase, listing);
+    return {
+      listing,
+      pageIndex: Math.floor(newerCount / safePageSize),
+    };
+  } catch (error) {
+    console.warn("공유 링크 대상 게시글 위치를 찾지 못했습니다.", error);
     return null;
   }
 }
@@ -291,21 +325,6 @@ function hasEnoughListingsForPage(listings = [], remoteMeta = null, requiredCoun
   return activeListings.length >= requiredCount;
 }
 
-function reconcileMetaForLoadedListings(remoteMeta = null, listings = []) {
-  if (!remoteMeta || remoteMeta.activeCount == null || !Number.isFinite(Number(remoteMeta.activeCount))) return remoteMeta;
-
-  const activeCount = filterActiveListings(listings).length;
-  if (activeCount < Number(remoteMeta.activeCount)) {
-    return {
-      ...remoteMeta,
-      activeCount,
-      inconsistent: true,
-    };
-  }
-
-  return remoteMeta;
-}
-
 function getListingPageCursor(listings = []) {
   const sortedListings = sortListingsByCreatedAtDesc(listings);
   const lastListing = sortedListings[sortedListings.length - 1];
@@ -376,9 +395,8 @@ export async function savePersonalListing(draftListing, formData, options = {}) 
     createdAt: existingIsActive ? existing.createdAt : draftListing.createdAt || now,
     updatedAt: now,
   };
-  const activeCountDelta = existingIsActive ? 0 : 1;
-
-  await writeListingAndMeta(firebase, listingRef, listing, activeCountDelta, now);
+  const nextRevision = await writeListingAndMeta(firebase, listingRef, listing, now);
+  await refreshRemoteListingsCount(firebase, nextRevision);
   await deleteStoragePaths(firebase, obsoleteStoragePaths);
 
   const localResult = upsertPersonalListing(loadLocalListings(), listing, formData ?? listing, {
@@ -418,7 +436,7 @@ export async function deletePersonalListing() {
 
   if (existing && existing.active !== false) {
     const storagePaths = collectStoragePaths(existing.images);
-    await writeListingDeletionAndMeta(firebase, listingRef, deletionRef, {
+    const nextRevision = await writeListingDeletionAndMeta(firebase, listingRef, deletionRef, {
       listingId: user.uid,
       ownerUid: user.uid,
       deletedAt: now,
@@ -426,6 +444,7 @@ export async function deletePersonalListing() {
       storagePaths,
       storageBytes: sumImageSizes(existing.images),
     }, now);
+    await refreshRemoteListingsCount(firebase, nextRevision);
     await deleteStoragePaths(firebase, storagePaths);
   }
 
@@ -511,6 +530,7 @@ async function initializeFirebaseReadState() {
     db: firestoreModule.getFirestore(app),
     collection: firestoreModule.collection,
     doc: firestoreModule.doc,
+    getCount: firestoreModule.getCount,
     getDoc: firestoreModule.getDoc,
     getDocs: firestoreModule.getDocs,
     limit: firestoreModule.limit,
@@ -566,7 +586,9 @@ async function initializeFirebaseState() {
     increment: firestoreModule.increment,
     getDoc: firestoreModule.getDoc,
     getDocs: firestoreModule.getDocs,
+    getCount: firestoreModule.getCount,
     query: firestoreModule.query,
+    runTransaction: firestoreModule.runTransaction,
     setDoc: firestoreModule.setDoc,
     signInAnonymously: authModule.signInAnonymously,
     deleteObject: storageModule.deleteObject,
@@ -614,6 +636,8 @@ async function prepareRemoteImage(firebase, ownerUid, image, index = 0, uploadBa
     compressed: Boolean(image.compressed),
     resolutionReduced: Boolean(image.resolutionReduced),
     profileSignature: image.profileSignature || "",
+    sheetPageIndex: Number.isFinite(Number(image.sheetPageIndex)) ? Number(image.sheetPageIndex) : null,
+    sheetPageCount: Number.isFinite(Number(image.sheetPageCount)) ? Number(image.sheetPageCount) : null,
     size: image.size || null,
     width: Number.isFinite(Number(image.width)) ? Number(image.width) : null,
     height: Number.isFinite(Number(image.height)) ? Number(image.height) : null,
@@ -631,6 +655,8 @@ function createStoredImageMetadata(image, index = 0) {
     compressed: Boolean(image.compressed),
     resolutionReduced: Boolean(image.resolutionReduced),
     profileSignature: image.profileSignature || "",
+    sheetPageIndex: Number.isFinite(Number(image.sheetPageIndex)) ? Number(image.sheetPageIndex) : null,
+    sheetPageCount: Number.isFinite(Number(image.sheetPageCount)) ? Number(image.sheetPageCount) : null,
     size: image.size || image.originalSize || null,
     width: Number.isFinite(Number(image.width)) ? Number(image.width) : null,
     height: Number.isFinite(Number(image.height)) ? Number(image.height) : null,
@@ -726,6 +752,17 @@ async function loadRemoteListingsMeta(firebase) {
   return snapshot.exists() ? normalizeRemoteListingsMeta(snapshot.data()) : null;
 }
 
+async function loadRemoteListingById(firebase, listingId) {
+  const normalizedListingId = normalizeListingId(listingId);
+  if (!normalizedListingId) return null;
+
+  const snapshot = await firebase.getDoc(firebase.doc(firebase.db, LISTINGS_COLLECTION, normalizedListingId));
+  if (!snapshot.exists()) return null;
+
+  const listing = normalizeRemoteListing(snapshot.id, snapshot.data());
+  return listing.active === false ? null : listing;
+}
+
 async function loadAllRemoteListings(firebase) {
   const snapshot = await firebase.getDocs(firebase.collection(firebase.db, LISTINGS_COLLECTION));
   return snapshot.docs
@@ -764,6 +801,26 @@ async function loadRemoteListingPage(firebase, options = {}) {
     .filter((listing) => listing.active !== false);
 }
 
+async function countRemoteListingsNewerThan(firebase, listing) {
+  const createdAt = normalizeOptionalDateValue(listing?.createdAt);
+  if (!createdAt) return 0;
+
+  if (firebase.getCount) {
+    const snapshot = await firebase.getCount(
+      firebase.query(
+        firebase.collection(firebase.db, LISTINGS_COLLECTION),
+        firebase.where("createdAt", ">", createdAt),
+      ),
+    );
+    const count = Number(snapshot.data()?.count ?? 0);
+    return Number.isFinite(count) ? count : 0;
+  }
+
+  const listings = sortListingsByCreatedAtDesc(await loadAllRemoteListings(firebase));
+  const index = listings.findIndex((candidate) => candidate.id === listing.id);
+  return index >= 0 ? index : 0;
+}
+
 async function loadRemoteDeletedListingChanges(firebase, lastSyncAt) {
   const snapshot = await firebase.getDocs(
     firebase.query(
@@ -775,49 +832,135 @@ async function loadRemoteDeletedListingChanges(firebase, lastSyncAt) {
   return snapshot.docs.map((document) => normalizeRemoteDeletedListing(document.id, document.data()));
 }
 
-async function writeListingAndMeta(firebase, listingRef, listing, activeCountDelta, updatedAt) {
+async function loadRemoteListingsCount(firebase) {
+  if (firebase.getCount) {
+    const snapshot = await firebase.getCount(firebase.collection(firebase.db, LISTINGS_COLLECTION));
+    const count = Number(snapshot.data()?.count ?? 0);
+    return Number.isFinite(count) ? count : 0;
+  }
+
+  return (await loadAllRemoteListings(firebase)).length;
+}
+
+async function refreshRemoteListingsCount(firebase, expectedRevision = null) {
+  try {
+    const activeCount = await loadRemoteListingsCount(firebase);
+    const metaRef = firebase.doc(firebase.db, META_COLLECTION, LISTINGS_META_DOCUMENT);
+    const countedAt = new Date().toISOString();
+    const normalizedExpectedRevision = Number(expectedRevision);
+
+    if (firebase.runTransaction && Number.isFinite(normalizedExpectedRevision)) {
+      return firebase.runTransaction(firebase.db, async (transaction) => {
+        const metaSnapshot = await transaction.get(metaRef);
+        const remoteRevision = normalizeRevision(metaSnapshot.exists() ? metaSnapshot.data()?.revision : 0);
+
+        if (remoteRevision !== normalizedExpectedRevision) return false;
+
+        transaction.set(metaRef, {
+          activeCount,
+          countedAt,
+        }, { merge: true });
+        return true;
+      });
+    }
+
+    await firebase.setDoc(metaRef, {
+      activeCount,
+      countedAt,
+    }, { merge: true });
+    return true;
+  } catch (error) {
+    console.warn("Firebase activeCount를 count() 결과로 갱신하지 못했습니다.", error);
+    return false;
+  }
+}
+
+async function writeListingAndMeta(firebase, listingRef, listing, updatedAt) {
   const metaRef = firebase.doc(firebase.db, META_COLLECTION, LISTINGS_META_DOCUMENT);
+
+  if (firebase.runTransaction) {
+    return firebase.runTransaction(firebase.db, async (transaction) => {
+      const metaSnapshot = await transaction.get(metaRef);
+      const nextRevision = getNextRevision(metaSnapshot);
+
+      transaction.set(listingRef, listing);
+      transaction.set(metaRef, {
+        revision: nextRevision,
+        updatedAt,
+      }, { merge: true });
+
+      return nextRevision;
+    });
+  }
+
   const metaPatch = {
     revision: firebase.increment(1),
     updatedAt,
   };
-
-  if (activeCountDelta !== 0) {
-    metaPatch.activeCount = firebase.increment(activeCountDelta);
-  }
 
   if (firebase.writeBatch) {
     const batch = firebase.writeBatch(firebase.db);
     batch.set(listingRef, listing);
     batch.set(metaRef, metaPatch, { merge: true });
     await batch.commit();
-    return;
+    return null;
   }
 
   await firebase.setDoc(listingRef, listing);
   await firebase.setDoc(metaRef, metaPatch, { merge: true });
+  return null;
 }
 
 async function writeListingDeletionAndMeta(firebase, listingRef, deletionRef, deletion, updatedAt) {
   const metaRef = firebase.doc(firebase.db, META_COLLECTION, LISTINGS_META_DOCUMENT);
-  const metaPatch = {
-    revision: firebase.increment(1),
-    updatedAt,
-    activeCount: firebase.increment(-1),
-  };
+
+  if (firebase.runTransaction) {
+    return firebase.runTransaction(firebase.db, async (transaction) => {
+      const metaSnapshot = await transaction.get(metaRef);
+      const nextRevision = getNextRevision(metaSnapshot);
+
+      transaction.delete(listingRef);
+      transaction.set(deletionRef, deletion, { merge: true });
+      transaction.set(metaRef, {
+        revision: nextRevision,
+        updatedAt,
+      }, { merge: true });
+
+      return nextRevision;
+    });
+  }
 
   if (firebase.writeBatch) {
+    const metaPatch = {
+      revision: firebase.increment(1),
+      updatedAt,
+    };
     const batch = firebase.writeBatch(firebase.db);
     batch.delete(listingRef);
     batch.set(deletionRef, deletion, { merge: true });
     batch.set(metaRef, metaPatch, { merge: true });
     await batch.commit();
-    return;
+    return null;
   }
 
   await firebase.deleteDoc(listingRef);
   await firebase.setDoc(deletionRef, deletion, { merge: true });
-  await firebase.setDoc(metaRef, metaPatch, { merge: true });
+  await firebase.setDoc(metaRef, {
+    revision: firebase.increment(1),
+    updatedAt,
+  }, { merge: true });
+  return null;
+}
+
+function getNextRevision(metaSnapshot) {
+  const currentRevision = normalizeRevision(metaSnapshot.exists() ? metaSnapshot.data()?.revision : 0);
+  return currentRevision + 1;
+}
+
+function normalizeRevision(value) {
+  const revision = Number(value || 0);
+  if (!Number.isFinite(revision) || revision < 0) return 0;
+  return Math.floor(revision);
 }
 
 function normalizeRemoteListing(id, data) {
@@ -851,6 +994,10 @@ function normalizeRemoteListingsMeta(data) {
     updatedAt: normalizeOptionalDateValue(data?.updatedAt),
     activeCount: data?.activeCount != null && Number.isFinite(Number(data.activeCount)) ? Number(data.activeCount) : null,
   };
+}
+
+function normalizeListingId(value) {
+  return String(value ?? "").trim();
 }
 
 function normalizeDateValue(value) {

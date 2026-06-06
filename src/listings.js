@@ -7,10 +7,12 @@ import {
   LISTINGS_REFRESH_KEY,
   loadCachedListings,
   loadListingPage as loadStoredListingPage,
+  resolveListingShareTarget,
 } from "./listing-store.js";
 
 const PROFILE_KEY = "pokemon-market-profile";
 const LISTINGS_REFRESH_THROTTLE_MS = 5000;
+const LISTING_SHARE_PARAM = "listing";
 
 const listingList = document.getElementById("listingList");
 const listingPagination = document.getElementById("listingPagination");
@@ -41,6 +43,8 @@ let refreshInFlight = null;
 let pageLoadInFlight = null;
 let lastRefreshStartedAt = 0;
 let listingsBroadcastChannel = null;
+let sharedListingId = getSharedListingId();
+let highlightedListingId = sharedListingId;
 let paginationState = {
   pageIndex: 0,
   totalPages: 1,
@@ -114,11 +118,22 @@ async function initializeListingsPage() {
     renderListingCards(sortListingsForProfile(loadCachedListings().slice(0, DEFAULT_LISTINGS_PAGE_SIZE), loadProfile()), { loading: true });
   }
 
-  await renderListings(0);
+  const shareTarget = sharedListingId
+    ? await resolveListingShareTarget(sharedListingId, DEFAULT_LISTINGS_PAGE_SIZE)
+    : null;
+  const initialPageIndex = shareTarget?.pageIndex || 0;
+
+  if (sharedListingId && !shareTarget) {
+    listingIntro.textContent = "공유된 교환 글을 찾을 수 없습니다.";
+  }
+
+  await renderListings(initialPageIndex, {
+    focusListingId: shareTarget?.listing?.id || "",
+  });
   setupListingsAutoRefresh();
 }
 
-async function renderListings(pageIndex = paginationState.pageIndex || 0) {
+async function renderListings(pageIndex = paginationState.pageIndex || 0, options = {}) {
   currentProfile = loadProfile();
   const result = await loadStoredListingPage({
     pageIndex,
@@ -127,6 +142,10 @@ async function renderListings(pageIndex = paginationState.pageIndex || 0) {
   const listings = sortListingsForProfile(result.listings, currentProfile);
   renderListingCards(listings);
   renderPagination(result);
+
+  if (options.focusListingId) {
+    requestAnimationFrame(() => scrollToListingCard(options.focusListingId));
+  }
 }
 
 async function goToListingsPage(pageIndex) {
@@ -284,10 +303,80 @@ function setPaginationBusy(isBusy) {
   }
 }
 
+async function copyListingShareLink(listingId, button) {
+  if (!listingId) return;
+  const originalText = button.textContent;
+
+  try {
+    await copyTextToClipboard(createListingShareUrl(listingId));
+    button.textContent = "복사됨";
+    window.setTimeout(() => {
+      button.textContent = originalText;
+    }, 1600);
+  } catch (error) {
+    console.warn("공유 링크를 복사하지 못했습니다.", error);
+    button.textContent = "실패";
+    window.setTimeout(() => {
+      button.textContent = originalText;
+    }, 1600);
+  }
+}
+
+function scrollToListingCard(listingId) {
+  const card = [...listingList.querySelectorAll("[data-listing-id]")]
+    .find((candidate) => candidate.dataset.listingId === listingId);
+  if (!card) return;
+
+  highlightedListingId = listingId;
+  card.classList.add("shared-target");
+  card.scrollIntoView({
+    block: "start",
+    behavior: "smooth",
+  });
+}
+
+function getSharedListingId() {
+  try {
+    return new URL(window.location.href).searchParams.get(LISTING_SHARE_PARAM)?.trim() || "";
+  } catch {
+    return "";
+  }
+}
+
+function createListingShareUrl(listingId) {
+  const url = new URL("./listings.html", window.location.href);
+  url.searchParams.set(LISTING_SHARE_PARAM, listingId);
+  url.hash = "";
+  return url.toString();
+}
+
+async function copyTextToClipboard(text) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.left = "-9999px";
+  document.body.append(textarea);
+  textarea.select();
+
+  try {
+    if (!document.execCommand("copy")) throw new Error("copy failed");
+  } finally {
+    textarea.remove();
+  }
+}
+
 function createListingCard(listing) {
   const highlightSets = createHighlightSets(currentProfile);
   const card = document.createElement("article");
   card.className = "listing-card";
+  card.dataset.listingId = listing.id || "";
+  if (listing.id && listing.id === highlightedListingId) card.classList.add("shared-target");
 
   const header = document.createElement("header");
   const titleGroup = document.createElement("div");
@@ -302,7 +391,17 @@ function createListingCard(listing) {
   const badge = document.createElement("span");
   badge.className = "badge";
   badge.textContent = listing.transferWilling ? "양도 의향 있음" : "교환 우선";
-  header.append(titleGroup, badge);
+
+  const shareButton = document.createElement("button");
+  shareButton.type = "button";
+  shareButton.className = "secondary listing-share-button";
+  shareButton.dataset.listingShareId = listing.id || "";
+  shareButton.textContent = "공유";
+
+  const headerActions = document.createElement("div");
+  headerActions.className = "listing-header-actions";
+  headerActions.append(badge, shareButton);
+  header.append(titleGroup, headerActions);
 
   const body = document.createElement("div");
   body.className = "listing-body";
@@ -415,6 +514,14 @@ function createCarouselControl(text, label, direction) {
 }
 
 function handleListingListClick(event) {
+  const shareButton = event.target.closest("[data-listing-share-id]");
+  if (shareButton) {
+    event.preventDefault();
+    event.stopPropagation();
+    copyListingShareLink(shareButton.dataset.listingShareId, shareButton);
+    return;
+  }
+
   const actionTarget = event.target.closest("[data-carousel-action]");
   if (!actionTarget) return;
 

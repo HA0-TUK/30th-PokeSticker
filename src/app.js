@@ -27,7 +27,10 @@ const MAX_USER_IMAGES = 5;
 const REFERENCE_ASSET_ORIGIN = "public";
 const SHEET_WIDTH = 2200;
 const SHEET_HEIGHT = 1400;
-const SHEET_LAYOUT_VERSION = "compact-left-no-label-v8-original-size";
+const SHEET_LAYOUT_VERSION = "compact-left-no-label-v12-hide-empty-groups";
+const SHEET_MAX_ITEMS_PER_ROW = 10;
+const SHEET_MAX_ITEMS_PER_COLUMN = 10;
+const SHEET_MIN_ITEM_CELL_HEIGHT = 104;
 const koreanNameCollator = new Intl.Collator("ko-KR", {
   sensitivity: "base",
   numeric: false,
@@ -41,7 +44,7 @@ let listingStoreMode = "local";
 let listingsCache = [];
 let sheetImageCache = {
   signature: "",
-  image: null,
+  images: [],
 };
 
 const elements = {
@@ -68,6 +71,7 @@ const elements = {
   imagePreview: document.getElementById("imagePreview"),
   transferWilling: document.getElementById("transferWilling"),
   publishButton: document.getElementById("publishButton"),
+  shareMyListingButton: document.getElementById("shareMyListingButton"),
   publishMessage: document.getElementById("publishMessage"),
 };
 
@@ -85,6 +89,7 @@ elements.publishForm.addEventListener("submit", preventFormSubmit);
 elements.publishForm.addEventListener("input", handleTrainerFormInput);
 elements.publishForm.addEventListener("change", handleTrainerFormChange);
 elements.publishButton.addEventListener("click", publishListing);
+elements.shareMyListingButton.addEventListener("click", shareMyListing);
 elements.imageInput.addEventListener("change", handleImageInput);
 elements.imagePreview.addEventListener("click", handleImagePreviewClick);
 
@@ -510,12 +515,31 @@ async function publishListing(event) {
   await saveOrUpdatePersonalListing(elements.publishMessage);
 }
 
+async function shareMyListing(event) {
+  event.preventDefault();
+  const listingId = getPersonalListingShareId();
+
+  if (!listingId) {
+    setMessage(elements.publishMessage, "공유할 교환 글이 없습니다. 먼저 교환 글을 게시하세요.", "error");
+    return;
+  }
+
+  try {
+    await copyTextToClipboard(createListingShareUrl(listingId));
+    setMessage(elements.publishMessage, "내 교환 글 공유 링크를 복사했습니다.", "success");
+  } catch (error) {
+    setMessage(elements.publishMessage, error.message, "error");
+  }
+}
+
 function updatePublishAvailability() {
   const validation = validateDraftForPublish(currentImport, {
     nickname: "placeholder",
     contact: "placeholder",
   });
+  const listingId = getPersonalListingShareId();
   elements.publishButton.disabled = !validation.ok;
+  elements.shareMyListingButton.disabled = listingStoreMode !== "firebase" || !listingId;
   elements.publishButton.textContent = getExistingPersonalListing() ? "교환 글 게시" : "교환 글 게시";
 }
 
@@ -562,6 +586,38 @@ function getExistingPersonalListing() {
   return findPersonalListing(listingsCache, getFormData(), {
     knownListingId: currentTrainer.listingId,
   });
+}
+
+function getPersonalListingShareId() {
+  return getExistingPersonalListing()?.id || currentTrainer.listingId || "";
+}
+
+function createListingShareUrl(listingId) {
+  const url = new URL("./listings.html", window.location.href);
+  url.searchParams.set("listing", listingId);
+  url.hash = "";
+  return url.toString();
+}
+
+async function copyTextToClipboard(text) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.left = "-9999px";
+  document.body.append(textarea);
+  textarea.select();
+
+  try {
+    if (!document.execCommand("copy")) throw new Error("공유 링크를 복사하지 못했습니다.");
+  } finally {
+    textarea.remove();
+  }
 }
 
 function applyTrainerInfo(trainer) {
@@ -681,8 +737,8 @@ function reindexUserImages(images) {
 
 async function getPublishFormData() {
   const formData = getFormData();
-  const tradeSheetImage = await getReusableProfileSheetImage(currentImport);
-  formData.images = [tradeSheetImage, ...currentUserImages];
+  const tradeSheetImages = await getReusableProfileSheetImages(currentImport);
+  formData.images = [...tradeSheetImages, ...currentUserImages];
   formData.image = formData.images[0];
 
   return formData;
@@ -703,9 +759,114 @@ function clearGeneratedImage() {
   saveTrainerFromForm();
 }
 
-async function createProfileSheetImage(profile, options = {}) {
+function createProfileSheetPages(profile) {
+  const remainingWantedGroups = cloneSheetGroups(profile?.wantedGroups);
+  const remainingOwnedGroups = cloneSheetGroups(profile?.ownedGroups);
+  const pages = [];
+  let guard = 0;
+
+  do {
+    const layoutWantedGroups = getNonEmptySheetGroups(remainingWantedGroups);
+    const layoutOwnedGroups = getNonEmptySheetGroups(remainingOwnedGroups);
+    const wantedGroups = takeSheetColumnPageGroups(remainingWantedGroups, layoutWantedGroups, "wanted");
+    const ownedGroups = takeSheetColumnPageGroups(remainingOwnedGroups, layoutOwnedGroups, "owned");
+
+    pages.push({
+      ...profile,
+      wantedGroups,
+      ownedGroups,
+      layoutWantedGroups,
+      layoutOwnedGroups,
+    });
+
+    guard += 1;
+  } while (guard < 80 && (hasSheetItems(remainingWantedGroups) || hasSheetItems(remainingOwnedGroups)));
+
+  return pages.length > 0
+    ? pages
+    : [{
+        ...profile,
+        wantedGroups: cloneSheetGroups(profile?.wantedGroups),
+        ownedGroups: cloneSheetGroups(profile?.ownedGroups),
+      }];
+}
+
+function cloneSheetGroups(groups = []) {
+  return (groups || []).map((group, index) => ({
+    ...group,
+    sheetGroupIndex: Number.isInteger(Number(group?.sheetGroupIndex)) ? Number(group.sheetGroupIndex) : index,
+    items: [...(group?.items || [])],
+  }));
+}
+
+function getNonEmptySheetGroups(groups = []) {
+  return (groups || []).filter((group) => (group?.items || []).length > 0);
+}
+
+function hasSheetItems(groups = []) {
+  return (groups || []).some((group) => (group?.items || []).length > 0);
+}
+
+function takeSheetColumnPageGroups(remainingGroups, layoutGroups, type) {
+  const layouts = getReferenceGroupLayouts(layoutGroups, {
+    type,
+    y: 40 + 86,
+    height: 1320 - 86,
+    gap: 8,
+  });
+
+  return getNonEmptySheetGroups(remainingGroups).map((group, index) => {
+    const remainingItems = group.items || [];
+    const remainingIndex = remainingGroups.findIndex((candidate) => getSheetGroupIndex(candidate, -1) === getSheetGroupIndex(group, index));
+    const layout = layouts[index] || { height: getReferenceGroupMinHeight(Boolean(getReferenceGroupHeader(group, index, type)), remainingItems.length === 0) };
+    const hasHeader = Boolean(getReferenceGroupHeader(group, index, type));
+    const contentHeight = Math.max(1, layout.height - (hasHeader ? 82 : 48));
+    const capacity = remainingItems.length > 0
+      ? Math.max(1, getReferenceGridCapacity(remainingItems.length, 1040 - 48, contentHeight))
+      : 0;
+    const items = remainingItems.slice(0, capacity);
+
+    if (remainingIndex >= 0) {
+      remainingGroups[remainingIndex] = {
+        ...group,
+        items: remainingItems.slice(capacity),
+      };
+    }
+
+    return {
+      ...group,
+      items,
+    };
+  });
+}
+
+async function createProfileSheetImages(profile, options = {}) {
   const { useImages = true } = options;
   const profileSignature = getProfileSheetSignature(profile);
+  const pages = createProfileSheetPages(profile);
+
+  try {
+    return await Promise.all(
+      pages.map((pageProfile, pageIndex) => createProfileSheetImage(pageProfile, {
+        useImages,
+        pageIndex,
+        pageCount: pages.length,
+        profileSignature,
+      })),
+    );
+  } catch (error) {
+    if (useImages) return createProfileSheetImages(profile, { useImages: false });
+    throw error;
+  }
+}
+
+async function createProfileSheetImage(profile, options = {}) {
+  const {
+    useImages = true,
+    pageIndex = 0,
+    pageCount = 1,
+    profileSignature = getProfileSheetSignature(profile),
+  } = options;
   const canvas = document.createElement("canvas");
   canvas.width = SHEET_WIDTH;
   canvas.height = SHEET_HEIGHT;
@@ -723,6 +884,7 @@ async function createProfileSheetImage(profile, options = {}) {
     accent: "#facc15",
     glow: "rgba(250, 204, 21, 0.55)",
     useImages,
+    layoutGroups: profile.layoutWantedGroups || profile.wantedGroups,
   });
   await drawReferenceColumn(context, {
     title: "보유중",
@@ -735,15 +897,10 @@ async function createProfileSheetImage(profile, options = {}) {
     accent: "#4ade80",
     glow: "rgba(74, 222, 128, 0.48)",
     useImages,
+    layoutGroups: profile.layoutOwnedGroups || profile.ownedGroups,
   });
 
-  let storageImage;
-  try {
-    storageImage = await canvasToStorageImage(canvas);
-  } catch (error) {
-    if (useImages) return createProfileSheetImage(profile, { useImages: false });
-    throw error;
-  }
+  const storageImage = await canvasToStorageImage(canvas, { pageIndex, pageCount });
 
   return {
     name: storageImage.name,
@@ -757,25 +914,28 @@ async function createProfileSheetImage(profile, options = {}) {
     resolutionReduced: storageImage.width < SHEET_WIDTH || storageImage.height < SHEET_HEIGHT,
     generatedAt: new Date().toISOString(),
     profileSignature,
+    sheetPageIndex: pageIndex,
+    sheetPageCount: pageCount,
   };
 }
 
-async function getReusableProfileSheetImage(profile) {
+async function getReusableProfileSheetImages(profile) {
   const profileSignature = getProfileSheetSignature(profile);
-  const existingImage = getReusableExistingSheetImage(profileSignature);
+  const pageCount = createProfileSheetPages(profile).length;
+  const existingImages = getReusableExistingSheetImages(profileSignature, pageCount);
 
-  if (existingImage) return existingImage;
-  if (sheetImageCache.signature === profileSignature && sheetImageCache.image) return sheetImageCache.image;
+  if (existingImages.length === pageCount) return existingImages;
+  if (sheetImageCache.signature === profileSignature && sheetImageCache.images.length === pageCount) return sheetImageCache.images;
 
-  const image = await createProfileSheetImage(profile);
+  const images = await createProfileSheetImages(profile);
   sheetImageCache = {
     signature: profileSignature,
-    image,
+    images,
   };
-  return image;
+  return images;
 }
 
-function getReusableExistingSheetImage(profileSignature) {
+function getReusableExistingSheetImages(profileSignature, pageCount) {
   const existingListing = getExistingPersonalListing();
   const images = Array.isArray(existingListing?.images)
     ? existingListing.images
@@ -783,11 +943,17 @@ function getReusableExistingSheetImage(profileSignature) {
       ? [existingListing.image]
       : [];
 
-  return images.find((image) =>
-    image?.generated
-      && image.profileSignature === profileSignature
-      && (image.url || image.dataUrl),
-  ) ?? null;
+  const byPage = new Map();
+  for (const image of images) {
+    if (!image?.generated || image.profileSignature !== profileSignature || !(image.url || image.dataUrl)) continue;
+
+    const imagePageCount = Number(image.sheetPageCount || 1);
+    const imagePageIndex = Number(image.sheetPageIndex || 0);
+    if (imagePageCount !== pageCount || !Number.isInteger(imagePageIndex) || imagePageIndex < 0 || imagePageIndex >= pageCount) continue;
+    if (!byPage.has(imagePageIndex)) byPage.set(imagePageIndex, image);
+  }
+
+  return Array.from({ length: pageCount }, (_, pageIndex) => byPage.get(pageIndex)).filter(Boolean);
 }
 
 function getProfileSheetSignature(profile) {
@@ -805,9 +971,13 @@ function getProfileSheetSignature(profile) {
   });
 }
 
-async function canvasToStorageImage(canvas) {
+async function canvasToStorageImage(canvas, options = {}) {
+  const pageIndex = Number(options.pageIndex || 0);
+  const pageCount = Math.max(1, Number(options.pageCount || 1));
+  const pageSuffix = pageCount > 1 ? `-${pageIndex + 1}-of-${pageCount}` : "";
+
   return canvasToStorageImageWithNames(canvas, {
-    baseName: "poke30-tra-compatible-sheet",
+    baseName: `poke30-tra-compatible-sheet${pageSuffix}`,
   });
 }
 
@@ -928,7 +1098,9 @@ async function drawReferenceBackground(context) {
 }
 
 async function drawReferenceColumn(context, options) {
-  const { title, groups, type, x, y, width, height, accent, glow, useImages } = options;
+  const { title, groups, layoutGroups = groups, type, x, y, width, height, accent, glow, useImages } = options;
+  const visibleGroups = getNonEmptySheetGroups(groups);
+  const visibleLayoutGroups = getNonEmptySheetGroups(layoutGroups);
 
   context.save();
   context.shadowColor = glow;
@@ -943,21 +1115,22 @@ async function drawReferenceColumn(context, options) {
   const boxY = y + 86;
   const boxHeightTotal = height - 86;
   const gap = 8;
-  const groupLayouts = getReferenceGroupLayouts(groups, {
+  const groupLayouts = getReferenceGroupLayouts(visibleLayoutGroups, {
     type,
     y: boxY,
     height: boxHeightTotal,
     gap,
   });
 
-  for (const [index, group] of groups.entries()) {
+  for (const [index, group] of visibleGroups.entries()) {
+    const layoutGroup = visibleLayoutGroups[index] || group;
     const groupLayout = groupLayouts[index];
     const groupY = groupLayout.y;
     const groupHeight = groupLayout.height;
     drawDashedReferenceBox(context, x, groupY, width, groupHeight);
 
     const headerText = getReferenceGroupHeader(group, index, type);
-    const headerColor = getReferenceGroupColor(index, type, accent);
+    const headerColor = getReferenceGroupColor(getSheetGroupIndex(group, index), type, accent);
     const hasHeader = Boolean(headerText);
     const contentTop = groupY + (hasHeader ? 62 : 24);
     const contentHeight = groupHeight - (hasHeader ? 82 : 48);
@@ -982,7 +1155,16 @@ async function drawReferenceColumn(context, options) {
       context.fillText(truncateCanvasText(context, group.subtitle, 420), x + width - 24, groupY + 25);
     }
 
-    await drawReferenceItems(context, group.items, x + 24, contentTop, width - 48, contentHeight, useImages);
+    await drawReferenceItems(
+      context,
+      group.items,
+      x + 24,
+      contentTop,
+      width - 48,
+      contentHeight,
+      useImages,
+      layoutGroup.items?.length || group.items?.length || 0,
+    );
   }
 }
 
@@ -1034,7 +1216,7 @@ function getReferenceGroupLayouts(groups, options) {
 
 function getReferenceGroupMinHeight(hasHeader, isEmpty) {
   if (isEmpty) return hasHeader ? 82 : 54;
-  return hasHeader ? 142 : 118;
+  return (hasHeader ? 82 : 48) + SHEET_MIN_ITEM_CELL_HEIGHT;
 }
 
 function drawDashedReferenceBox(context, x, y, width, height) {
@@ -1049,11 +1231,11 @@ function drawDashedReferenceBox(context, x, y, width, height) {
   context.restore();
 }
 
-async function drawReferenceItems(context, items, x, y, width, height, useImages) {
+async function drawReferenceItems(context, items, x, y, width, height, useImages, layoutCount = null) {
   if (!items.length || width <= 0 || height <= 0) return;
 
   const sortedItems = [...items].sort(compareItemsByKoreanName);
-  const layout = getReferenceGridLayout(sortedItems.length, width, height);
+  const layout = getReferenceGridLayout(Math.max(sortedItems.length, Number(layoutCount || 0)), width, height);
   const total = Math.min(sortedItems.length, layout.visibleCount);
 
   for (let index = 0; index < total; index += 1) {
@@ -1105,17 +1287,21 @@ async function drawReferenceItemCard(context, item, x, y, width, height, useImag
 function getReferenceGridLayout(count, width, height) {
   const density = getReferenceGridDensity(count);
   const { gap, maxWidth, maxHeight, minWidth, minHeight } = density;
-  const maxColumns = Math.min(count, Math.max(1, Math.floor((width + gap) / (minWidth + gap))));
+  const minCellHeight = getReferenceGridMinCellHeight(height, gap, minHeight);
+  const maxCellHeight = Math.max(maxHeight, minCellHeight);
+  const maxColumns = Math.min(count, SHEET_MAX_ITEMS_PER_ROW, Math.max(1, Math.floor((width + gap) / (minWidth + gap))));
   let bestFit = null;
 
   for (let columns = maxColumns; columns >= 1; columns -= 1) {
     const rows = Math.ceil(count / columns);
+    if (rows > SHEET_MAX_ITEMS_PER_COLUMN) continue;
+
     const rawCellWidth = (width - gap * (columns - 1)) / columns;
     const rawCellHeight = (height - gap * (rows - 1)) / rows;
-    if (rawCellWidth < minWidth || rawCellHeight < minHeight) continue;
+    if (rawCellWidth < minWidth || rawCellHeight < minCellHeight) continue;
 
     const cellWidth = Math.min(maxWidth, rawCellWidth);
-    const cellHeight = Math.min(maxHeight, rawCellHeight);
+    const cellHeight = Math.min(maxCellHeight, rawCellHeight);
     const emptyCells = columns * rows - count;
     const score = columns * 100000 - rows * 1000 - emptyCells * 100 + cellWidth * cellHeight;
     if (!bestFit || score > bestFit.score) {
@@ -1143,14 +1329,17 @@ function getReferenceGridLayout(count, width, height) {
 
   let bestOverflow = null;
   for (let columns = maxColumns; columns >= 1; columns -= 1) {
-    const rows = Math.max(1, Math.floor((height + gap) / (minHeight + gap)));
+    const rows = Math.min(
+      SHEET_MAX_ITEMS_PER_COLUMN,
+      Math.max(1, Math.floor((height + gap) / (minCellHeight + gap))),
+    );
     const rawCellWidth = (width - gap * (columns - 1)) / columns;
     const rawCellHeight = (height - gap * (rows - 1)) / rows;
-    if (rawCellWidth < minWidth || rawCellHeight < minHeight) continue;
+    if (rawCellWidth < minWidth || rawCellHeight < minCellHeight) continue;
 
     const visibleCount = columns * rows;
     const cellWidth = Math.min(maxWidth, rawCellWidth);
-    const cellHeight = Math.min(maxHeight, rawCellHeight);
+    const cellHeight = Math.min(maxCellHeight, rawCellHeight);
     const score = visibleCount * 100000 + columns * 1000 + Math.min(cellHeight, maxHeight);
     if (!bestOverflow || score > bestOverflow.score) {
       bestOverflow = {
@@ -1174,6 +1363,16 @@ function getReferenceGridLayout(count, width, height) {
   };
 }
 
+function getReferenceGridMinCellHeight(height, gap, fallbackMinHeight) {
+  const tenRowsHeight = (height - gap * (SHEET_MAX_ITEMS_PER_COLUMN - 1)) / SHEET_MAX_ITEMS_PER_COLUMN;
+  return Math.max(SHEET_MIN_ITEM_CELL_HEIGHT, fallbackMinHeight, tenRowsHeight);
+}
+
+function getReferenceGridCapacity(count, width, height) {
+  if (!count || width <= 0 || height <= 0) return 0;
+  return getReferenceGridLayout(count, width, height).visibleCount;
+}
+
 function getReferenceGridDensity(count) {
   if (count > 120) {
     return { gap: 4, maxWidth: 86, maxHeight: 98, minWidth: 36, minHeight: 44 };
@@ -1195,8 +1394,13 @@ function getReferenceGridDensity(count) {
 }
 
 function getReferenceGroupHeader(group, index, type) {
-  if (type === "wanted") return `${index + 1}순위`;
+  if (type === "wanted") return `${getSheetGroupIndex(group, index) + 1}순위`;
   return group.subtitle || "";
+}
+
+function getSheetGroupIndex(group, fallbackIndex = 0) {
+  const index = Number(group?.sheetGroupIndex);
+  return Number.isInteger(index) && index >= 0 ? index : fallbackIndex;
 }
 
 function getReferenceGroupColor(index, type, fallback) {

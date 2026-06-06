@@ -528,8 +528,19 @@ button.secondary:hover {
 }
 
 .profile-stack .post-fields .image-preview,
-.profile-stack .post-fields #publishButton {
+.profile-stack .post-fields .publish-actions {
   grid-column: 2;
+}
+
+.publish-actions {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.publish-actions button {
+  flex: 1 1 150px;
 }
 
 .post-panel textarea {
@@ -677,12 +688,32 @@ button.secondary:hover {
   background: #111827;
 }
 
+.listing-card.shared-target {
+  border-color: var(--yellow);
+  box-shadow: 0 0 0 2px rgba(250, 204, 21, 0.28), 0 18px 42px rgba(0, 0, 0, 0.24);
+}
+
 .listing-card header {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
   gap: 14px;
   margin-bottom: 14px;
+}
+
+.listing-header-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.listing-share-button {
+  min-width: 64px;
+  min-height: 32px;
+  padding: 0 10px;
+  font-size: 12px;
 }
 
 .listing-card h3 {
@@ -1202,7 +1233,7 @@ button.secondary:hover {
 
   .profile-stack .post-fields .field:first-child,
   .profile-stack .post-fields .image-preview,
-  .profile-stack .post-fields #publishButton {
+  .profile-stack .post-fields .publish-actions {
     grid-column: auto;
     grid-row: auto;
   }
