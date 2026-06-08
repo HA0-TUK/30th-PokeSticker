@@ -1,4 +1,10 @@
-import { sortListingsForProfile } from "./importer.js";
+import { stickers } from "./catalog-data.js";
+import {
+  createCatalogIndex,
+  getItemKey,
+  refreshImportedData,
+  sortListingsForProfile,
+} from "./importer.js";
 import {
   DEFAULT_LISTINGS_PAGE_SIZE,
   deletePersonalListing,
@@ -13,6 +19,7 @@ import {
 const PROFILE_KEY = "pokemon-market-profile";
 const LISTINGS_REFRESH_THROTTLE_MS = 5000;
 const LISTING_SHARE_PARAM = "listing";
+const catalogIndex = createCatalogIndex(stickers);
 
 const listingList = document.getElementById("listingList");
 const listingPagination = document.getElementById("listingPagination");
@@ -58,7 +65,7 @@ const preloadedImageSources = new Set();
 resetListingsButton.addEventListener("click", async () => {
   const message =
     listingStoreMode === "firebase"
-      ? "저장된 내 교환 글을 삭제할까요?"
+      ? "내 교환 글을 목록에서 삭제할까요?\n첨부 이미지는 마이페이지에서 다시 게시할 수 있도록 보존됩니다."
       : "현재 브라우저에 저장된 교환 글을 모두 비울까요?";
   if (!window.confirm(message)) return;
 
@@ -499,6 +506,7 @@ function createListingGallery(images, listing) {
     startX: 0,
     swiped: false,
   });
+  image.addEventListener("error", () => handleListingImageError(carousel, image.currentSrc || image.src));
   queueCarouselInitialLoad(carousel);
   return gallery;
 }
@@ -539,6 +547,7 @@ function handleListingListClick(event) {
       return;
     }
     ensureCarouselLoaded(carousel);
+    if (!getListingImageSource(state.images[state.activeIndex])) return;
     showImageModal(state.images, state.activeIndex);
     return;
   }
@@ -615,7 +624,9 @@ function setCarouselImage(carousel, nextIndex) {
     if (state.image.getAttribute("src") !== source) state.image.src = source;
   } else {
     state.image.removeAttribute("src");
-    renderFallbackPreview(state.fallbackPreview, state.listing, listingImage);
+    renderFallbackPreview(state.fallbackPreview, state.listing, listingImage, {
+      missing: Boolean(listingImage?.loadFailed),
+    });
   }
   state.frameButton.classList.toggle("missing-preview", !source);
   state.image.alt = listingImage.name || "첨부 이미지";
@@ -628,6 +639,22 @@ function setCarouselImage(carousel, nextIndex) {
   });
 
   scheduleAdjacentImagePreload(state.images, state.activeIndex);
+}
+
+function handleListingImageError(carousel, failedSource = "") {
+  const state = carouselStates.get(carousel);
+  if (!state || state.images.length === 0) return;
+
+  const listingImage = state.images[state.activeIndex];
+  const expectedSource = getListingImageSource(listingImage, { includeFailed: true });
+  if (failedSource && expectedSource && failedSource !== expectedSource) return;
+
+  listingImage.loadFailed = true;
+  state.image.removeAttribute("src");
+  renderFallbackPreview(state.fallbackPreview, state.listing, listingImage, {
+    missing: true,
+  });
+  state.frameButton.classList.add("missing-preview");
 }
 
 function queueCarouselInitialLoad(carousel) {
@@ -681,6 +708,9 @@ function preloadListingImage(image) {
   preloadedImageSources.add(source);
   const imageElement = new Image();
   imageElement.decoding = "async";
+  imageElement.addEventListener("error", () => {
+    image.loadFailed = true;
+  });
   imageElement.src = source;
 }
 
@@ -722,16 +752,24 @@ function showModalImageAt(nextIndex) {
   modalCounter.classList.toggle("hidden", modalImages.length <= 1);
 }
 
-function getListingImageSource(image) {
+function getListingImageSource(image, options = {}) {
+  if (!options.includeFailed && image?.loadFailed) return "";
   return image?.url || image?.dataUrl || "";
 }
 
-function renderFallbackPreview(container, listing, image) {
+function renderFallbackPreview(container, listing, image, options = {}) {
   container.innerHTML = "";
 
   const title = document.createElement("strong");
   title.textContent = image?.generated ? "교환 목록 미리보기" : image?.name || "첨부 이미지";
   container.append(title);
+
+  if (options.missing) {
+    const note = document.createElement("span");
+    note.textContent = "이미지를 다시 첨부해야 합니다.";
+    container.append(note);
+    return;
+  }
 
   if (!image?.generated) {
     const note = document.createElement("span");
@@ -897,19 +935,10 @@ function createItemSet(groups) {
   return set;
 }
 
-function getItemKey(item) {
-  return item?.normalizedKey || normalizeStickerKey(item?.key || item?.rawKey);
-}
-
-function normalizeStickerKey(value) {
-  return String(value ?? "")
-    .replace(/[\s_]+/g, "")
-    .toLowerCase();
-}
-
 function loadProfile() {
   try {
-    return JSON.parse(localStorage.getItem(PROFILE_KEY) || "null");
+    const profile = JSON.parse(localStorage.getItem(PROFILE_KEY) || "null");
+    return profile ? refreshImportedData(profile, catalogIndex) : null;
   } catch {
     return null;
   }

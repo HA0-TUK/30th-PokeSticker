@@ -3,6 +3,7 @@ import {
   buildListing,
   createCatalogIndex,
   findPersonalListing,
+  getItemKey,
   makeStickerItem,
   normalizeStickerKey,
   parseReferenceInput,
@@ -37,7 +38,7 @@ const koreanNameCollator = new Intl.Collator("ko-KR", {
 });
 
 const catalogIndex = createCatalogIndex(stickers);
-let currentImport = refreshImportedData(loadProfile() || createEmptyProfile());
+let currentImport = refreshImportedData(loadProfile() || createEmptyProfile(), catalogIndex);
 let currentTrainer = loadTrainerInfo();
 let currentUserImages = getTrainerUserImages(currentTrainer);
 let listingStoreMode = "local";
@@ -125,7 +126,7 @@ async function parseInput() {
   setMessage(elements.publishMessage, "");
 
   try {
-    currentImport = refreshImportedData(parseReferenceInput(elements.importInput.value, catalogIndex, { allowJson: false }));
+    currentImport = refreshImportedData(parseReferenceInput(elements.importInput.value, catalogIndex, { allowJson: false }), catalogIndex);
     clearGeneratedImage();
     clearListingCache();
     listingsCache = [];
@@ -317,8 +318,9 @@ async function handleSearchResultClick(event) {
 
   const category = group.id.startsWith("priority-") ? "wanted" : "owned";
   const categoryGroups = category === "wanted" ? currentImport.wantedGroups : currentImport.ownedGroups;
+  const stickerItemKey = getItemKey(sticker);
   const alreadyExists = categoryGroups.some((candidateGroup) =>
-    candidateGroup.items.some((item) => item.normalizedKey === sticker.normalizedKey),
+    candidateGroup.items.some((item) => getItemKey(item) === stickerItemKey),
   );
 
   if (alreadyExists) {
@@ -348,7 +350,7 @@ function handlePreviewInput(event) {
   if (!group) return;
 
   group.subtitle = event.target.value;
-  currentImport = refreshImportedData(currentImport);
+  currentImport = refreshImportedData(currentImport, catalogIndex);
   saveProfile(currentImport);
 }
 
@@ -362,7 +364,7 @@ function findGroup(groupId) {
 }
 
 function persistProfile(message) {
-  currentImport = refreshImportedData(currentImport);
+  currentImport = refreshImportedData(currentImport, catalogIndex);
   clearGeneratedImage();
   saveProfile(currentImport);
   renderPreview(currentImport);
@@ -665,7 +667,7 @@ function createEmptyProfile() {
     rawData: null,
   };
 
-  return refreshImportedData(profile);
+  return refreshImportedData(profile, catalogIndex);
 }
 
 function loadProfile() {
@@ -961,7 +963,7 @@ function getProfileSheetSignature(profile) {
     (groups || []).map((group) => ({
       id: group.id,
       subtitle: group.subtitle || "",
-      items: (group.items || []).map((item) => item.normalizedKey || item.key || item.rawKey || ""),
+      items: (group.items || []).map((item) => getItemKey(item)),
     }));
 
   return JSON.stringify({

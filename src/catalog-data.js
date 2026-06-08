@@ -6342,10 +6342,10 @@
         "imagePath":  "/icons/0826.png"
     },
     {
-        "key":  "0827.훔훔아",
-        "normalizedKey":  "0827.훔훔아",
+        "key":  "0827.훔쳐우",
+        "normalizedKey":  "0827.훔쳐우",
         "number":  "0827",
-        "name":  "훔훔아",
+        "name":  "훔쳐우",
         "imagePath":  "/icons/0827.png"
     },
     {

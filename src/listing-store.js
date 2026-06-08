@@ -1,5 +1,14 @@
 import { firebaseConfig, firebaseOptions } from "./firebase-config.js";
-import { createListingOwnerKey, upsertPersonalListing } from "./importer.js";
+import { stickers } from "./catalog-data.js";
+import {
+  CATALOG_SCHEMA_VERSION,
+  canonicalizeListingData,
+  collectGroupItemKeys,
+  compactGroupsForStorage,
+  createCatalogIndex,
+  createListingOwnerKey,
+  upsertPersonalListing,
+} from "./importer.js";
 
 const FIREBASE_SDK_VERSION = "12.7.0";
 const LISTINGS_KEY = "pokemon-market-listings";
@@ -16,6 +25,7 @@ const SYNC_CACHE_VERSION = 3;
 const INCREMENTAL_SYNC_MAX_AGE_DAYS = 25;
 export const DEFAULT_LISTINGS_PAGE_SIZE = 10;
 const STORAGE_CACHE_CONTROL = "public,max-age=31536000,immutable";
+const catalogIndex = createCatalogIndex(stickers);
 
 let firebaseStatePromise = null;
 let firebaseReadStatePromise = null;
@@ -363,7 +373,8 @@ export async function savePersonalListing(draftListing, formData, options = {}) 
   const firebase = await getFirebaseState();
 
   if (!firebase) {
-    const result = upsertPersonalListing(loadLocalListings(), draftListing, formData, options);
+    const normalizedDraftListing = normalizeListingCatalogFields(draftListing);
+    const result = upsertPersonalListing(loadLocalListings(), normalizedDraftListing, formData, options);
     saveLocalListings(result.listings);
     announceListingsChanged({ action: result.action || "saved", listingId: result.listing?.id || "" });
     return result;
@@ -379,10 +390,11 @@ export async function savePersonalListing(draftListing, formData, options = {}) 
   const now = new Date().toISOString();
   const images = await prepareRemoteImages(firebase, user.uid, draftListing.images ?? (draftListing.image ? [draftListing.image] : []));
   const obsoleteStoragePaths = collectObsoleteStoragePaths(existing?.images, images);
+  const normalizedDraftListing = normalizeListingCatalogFields(draftListing);
 
   const listing = {
     ...(existingIsActive ? existing : {}),
-    ...draftListing,
+    ...normalizedDraftListing,
     id: user.uid,
     ownerUid: user.uid,
     ownerKey: createListingOwnerKey(formData ?? draftListing),
@@ -390,12 +402,13 @@ export async function savePersonalListing(draftListing, formData, options = {}) 
     deletedAt: null,
     images,
     image: images[0] ?? null,
-    wantedKeys: collectGroupKeys(draftListing.wantedGroups),
-    ownedKeys: collectGroupKeys(draftListing.ownedGroups),
+    wantedKeys: collectGroupKeys(normalizedDraftListing.wantedGroups),
+    ownedKeys: collectGroupKeys(normalizedDraftListing.ownedGroups),
+    catalogSchemaVersion: CATALOG_SCHEMA_VERSION,
     createdAt: existingIsActive ? existing.createdAt : draftListing.createdAt || now,
     updatedAt: now,
   };
-  const nextRevision = await writeListingAndMeta(firebase, listingRef, listing, now);
+  const nextRevision = await writeListingAndMeta(firebase, listingRef, compactListingForStorage(listing), now);
   await refreshRemoteListingsCount(firebase, nextRevision);
   await deleteStoragePaths(firebase, obsoleteStoragePaths);
 
@@ -445,7 +458,6 @@ export async function deletePersonalListing() {
       storageBytes: sumImageSizes(existing.images),
     }, now);
     await refreshRemoteListingsCount(firebase, nextRevision);
-    await deleteStoragePaths(firebase, storagePaths);
   }
 
   const remaining = loadLocalListings().filter((listing) => listing.id !== user.uid && listing.ownerUid !== user.uid);
@@ -963,10 +975,25 @@ function normalizeRevision(value) {
   return Math.floor(revision);
 }
 
+function normalizeListingCatalogFields(listing = {}) {
+  return canonicalizeListingData(listing, catalogIndex);
+}
+
+function compactListingForStorage(listing = {}) {
+  return {
+    ...listing,
+    catalogSchemaVersion: CATALOG_SCHEMA_VERSION,
+    wantedGroups: compactGroupsForStorage(listing.wantedGroups, catalogIndex, "wanted"),
+    ownedGroups: compactGroupsForStorage(listing.ownedGroups, catalogIndex, "owned"),
+    wantedKeys: collectGroupKeys(listing.wantedGroups),
+    ownedKeys: collectGroupKeys(listing.ownedGroups),
+  };
+}
+
 function normalizeRemoteListing(id, data) {
   const images = Array.isArray(data?.images) ? data.images : data?.image ? [data.image] : [];
 
-  return {
+  return normalizeListingCatalogFields({
     ...data,
     id: data?.id || id,
     active: data?.active !== false,
@@ -975,7 +1002,7 @@ function normalizeRemoteListing(id, data) {
     createdAt: normalizeDateValue(data?.createdAt),
     updatedAt: data?.updatedAt ? normalizeDateValue(data.updatedAt) : null,
     deletedAt: data?.deletedAt ? normalizeDateValue(data.deletedAt) : null,
-  };
+  });
 }
 
 function normalizeRemoteDeletedListing(id, data) {
@@ -1015,12 +1042,13 @@ function normalizeOptionalDateValue(value) {
 }
 
 function collectGroupKeys(groups) {
-  return [...new Set((groups || []).flatMap((group) => (group.items || []).map((item) => item.normalizedKey).filter(Boolean)))];
+  return collectGroupItemKeys(groups);
 }
 
 function loadLocalListings() {
   try {
-    return filterActiveListings(JSON.parse(localStorage.getItem(LISTINGS_KEY) || "[]"));
+    const listings = JSON.parse(localStorage.getItem(LISTINGS_KEY) || "[]");
+    return filterActiveListings((Array.isArray(listings) ? listings : []).map(normalizeListingCatalogFields));
   } catch {
     return [];
   }
@@ -1048,7 +1076,7 @@ function loadLocalSyncState() {
 }
 
 function saveLocalListings(listings, syncState = null) {
-  localStorage.setItem(LISTINGS_KEY, JSON.stringify(filterActiveListings(listings)));
+  localStorage.setItem(LISTINGS_KEY, JSON.stringify(filterActiveListings((listings || []).map(normalizeListingCatalogFields))));
   if (syncState) localStorage.setItem(LISTINGS_SYNC_KEY, JSON.stringify(syncState));
 }
 

@@ -1,6 +1,7 @@
 import { decompressFromBase64 } from "./lz-string.js";
 
 export const REFERENCE_SAVE_KEY = "poke-sheet-save-data";
+export const CATALOG_SCHEMA_VERSION = 2;
 
 export function normalizeStickerKey(value) {
   return String(value ?? "")
@@ -8,21 +9,179 @@ export function normalizeStickerKey(value) {
     .toLowerCase();
 }
 
+function normalizeImagePath(value) {
+  return String(value ?? "")
+    .trim()
+    .replace(/\\/g, "/")
+    .split("#")[0]
+    .split("?")[0];
+}
+
+function extractStickerNumber(value) {
+  return String(value ?? "").trim().match(/^(\d{4})(?:[\s._-]|$)/)?.[1] || "";
+}
+
 export function createCatalogIndex(stickers) {
   const byNormalizedKey = new Map();
+  const byCatalogId = new Map();
+  const byImagePath = new Map();
+  const byNumber = new Map();
+  const numberBuckets = new Map();
+  const preparedStickers = [];
 
   for (const sticker of stickers ?? []) {
     const normalizedKey = sticker.normalizedKey || normalizeStickerKey(sticker.key);
-    byNormalizedKey.set(normalizedKey, {
+    const catalogId = sticker.catalogId || getCatalogIdFromImagePath(sticker.imagePath);
+    const imagePath = normalizeImagePath(sticker.imagePath);
+    const preparedSticker = {
       ...sticker,
+      catalogId,
       normalizedKey,
-    });
+    };
+
+    preparedStickers.push(preparedSticker);
+    byNormalizedKey.set(normalizedKey, preparedSticker);
+    if (catalogId) byCatalogId.set(catalogId, preparedSticker);
+    if (imagePath) byImagePath.set(imagePath, preparedSticker);
+
+    const number = String(sticker.number ?? "").trim();
+    if (number) {
+      const bucket = numberBuckets.get(number) || [];
+      bucket.push(preparedSticker);
+      numberBuckets.set(number, bucket);
+    }
+  }
+
+  for (const [number, bucket] of numberBuckets) {
+    if (bucket.length === 1) byNumber.set(number, bucket[0]);
   }
 
   return {
-    stickers,
+    stickers: preparedStickers,
+    byCatalogId,
+    byImagePath,
     byNormalizedKey,
+    byNumber,
   };
+}
+
+export function getCatalogIdFromImagePath(imagePath) {
+  const normalizedPath = normalizeImagePath(imagePath);
+  if (!normalizedPath) return "";
+
+  const fileName = normalizedPath.split("/").filter(Boolean).pop() || "";
+  return fileName.replace(/\.[^.]+$/, "");
+}
+
+export function findCatalogSticker(item, catalogIndex) {
+  if (!item || !catalogIndex) return null;
+
+  const rawValue = typeof item === "string" ? item : "";
+  const catalogId = String(typeof item === "object" ? item.catalogId ?? "" : "").trim();
+  if (catalogId && catalogIndex.byCatalogId?.has(catalogId)) {
+    return catalogIndex.byCatalogId.get(catalogId);
+  }
+
+  const imagePath = normalizeImagePath(typeof item === "object" ? item.imagePath : "");
+  if (imagePath && catalogIndex.byImagePath?.has(imagePath)) {
+    return catalogIndex.byImagePath.get(imagePath);
+  }
+
+  const imageCatalogId = getCatalogIdFromImagePath(imagePath);
+  if (imageCatalogId && catalogIndex.byCatalogId?.has(imageCatalogId)) {
+    return catalogIndex.byCatalogId.get(imageCatalogId);
+  }
+
+  const normalizedKey = typeof item === "object"
+    ? item.normalizedKey || normalizeStickerKey(item.key || item.rawKey || item.name)
+    : normalizeStickerKey(rawValue);
+  if (normalizedKey && catalogIndex.byNormalizedKey?.has(normalizedKey)) {
+    return catalogIndex.byNormalizedKey.get(normalizedKey);
+  }
+
+  const number = typeof item === "object"
+    ? String(item.number ?? "").trim() || extractStickerNumber(item.key || item.rawKey)
+    : extractStickerNumber(rawValue);
+  if (number && catalogIndex.byNumber?.has(number)) {
+    return catalogIndex.byNumber.get(number);
+  }
+
+  return null;
+}
+
+export function canonicalizeStickerItem(item, catalogIndex, category = "owned") {
+  const source = typeof item === "object" && item ? item : { rawKey: item };
+  const sticker = findCatalogSticker(source, catalogIndex);
+  const itemCategory = source.category || category;
+
+  if (sticker) return makeStickerItem(sticker, itemCategory);
+
+  const imagePath = source.imagePath ?? "";
+  const catalogId = source.catalogId || getCatalogIdFromImagePath(imagePath);
+  const rawKey = source.rawKey ?? source.key ?? source.name ?? catalogId ?? "";
+  const normalizedKey = source.normalizedKey || normalizeStickerKey(rawKey);
+
+  return {
+    ...source,
+    rawKey: String(rawKey ?? ""),
+    normalizedKey,
+    key: String(source.key ?? rawKey ?? ""),
+    name: String(source.name ?? ""),
+    number: String(source.number ?? ""),
+    imagePath: String(imagePath ?? ""),
+    catalogId,
+    category: itemCategory,
+    status: "unknown",
+  };
+}
+
+export function canonicalizeGroups(groups, catalogIndex, category = "owned") {
+  return (groups || []).map((group) => ({
+    ...group,
+    items: (group?.items || []).map((item) => canonicalizeStickerItem(item, catalogIndex, category)),
+  }));
+}
+
+export function canonicalizeListingData(listing, catalogIndex) {
+  const wantedGroups = canonicalizeGroups(listing?.wantedGroups, catalogIndex, "wanted");
+  const ownedGroups = canonicalizeGroups(listing?.ownedGroups, catalogIndex, "owned");
+
+  return {
+    ...listing,
+    catalogSchemaVersion: CATALOG_SCHEMA_VERSION,
+    wantedGroups,
+    ownedGroups,
+    wantedKeys: collectGroupItemKeys(wantedGroups),
+    ownedKeys: collectGroupItemKeys(ownedGroups),
+  };
+}
+
+export function compactStickerItemForStorage(item, catalogIndex, category = "owned") {
+  const canonicalItem = canonicalizeStickerItem(item, catalogIndex, category);
+  if (canonicalItem.status !== "unknown" && canonicalItem.catalogId) {
+    return { catalogId: canonicalItem.catalogId };
+  }
+
+  const compact = {};
+  for (const field of ["catalogId", "rawKey", "normalizedKey", "key", "name", "number", "imagePath", "status"]) {
+    if (canonicalItem[field] != null && String(canonicalItem[field]).trim()) {
+      compact[field] = canonicalItem[field];
+    }
+  }
+  return compact;
+}
+
+export function compactGroupsForStorage(groups, catalogIndex, category = "owned") {
+  return (groups || []).map((group) => ({
+    ...group,
+    items: (group?.items || []).map((item) => compactStickerItemForStorage(item, catalogIndex, category)),
+  }));
+}
+
+export function collectGroupItemKeys(groups) {
+  return [...new Set((groups || []).flatMap((group) =>
+    (group?.items || []).map(getItemKey).filter(Boolean),
+  ))];
 }
 
 export function decodeReferenceInput(input, options = {}) {
@@ -67,12 +226,17 @@ export function parseReferenceInput(input, catalogIndex, options = {}) {
   return transformReferenceData(decodeReferenceInput(input, options), catalogIndex);
 }
 
-export function refreshImportedData(importedData) {
-  const wantedGroups = importedData?.wantedGroups ?? [];
-  const ownedGroups = importedData?.ownedGroups ?? [];
+export function refreshImportedData(importedData, catalogIndex = null) {
+  const wantedGroups = catalogIndex
+    ? canonicalizeGroups(importedData?.wantedGroups ?? [], catalogIndex, "wanted")
+    : importedData?.wantedGroups ?? [];
+  const ownedGroups = catalogIndex
+    ? canonicalizeGroups(importedData?.ownedGroups ?? [], catalogIndex, "owned")
+    : importedData?.ownedGroups ?? [];
 
   return {
     ...importedData,
+    catalogSchemaVersion: catalogIndex ? CATALOG_SCHEMA_VERSION : importedData?.catalogSchemaVersion,
     wantedGroups,
     ownedGroups,
     validation: validateImportedGroups(wantedGroups, ownedGroups),
@@ -81,8 +245,10 @@ export function refreshImportedData(importedData) {
 
 export function makeStickerItem(sticker, category = "owned") {
   const normalizedKey = sticker?.normalizedKey || normalizeStickerKey(sticker?.key);
+  const catalogId = sticker?.catalogId || getCatalogIdFromImagePath(sticker?.imagePath);
 
   return {
+    catalogId,
     rawKey: sticker?.key ?? "",
     normalizedKey,
     key: sticker?.key ?? "",
@@ -243,7 +409,7 @@ function normalizeOwnedGroups(rawData, catalogIndex) {
 function normalizeItems(items, catalogIndex, category) {
   return toArray(items).map((rawKey) => {
     const normalizedKey = normalizeStickerKey(rawKey);
-    const sticker = catalogIndex?.byNormalizedKey?.get(normalizedKey);
+    const sticker = findCatalogSticker({ rawKey, normalizedKey }, catalogIndex);
 
     return sticker
       ? makeStickerItem(sticker, category)
@@ -254,6 +420,7 @@ function normalizeItems(items, catalogIndex, category) {
           name: "",
           number: "",
           imagePath: "",
+          catalogId: "",
           category,
           status: "unknown",
         };
@@ -275,7 +442,7 @@ function validateImportedGroups(wantedGroups, ownedGroups) {
   ]);
 
   for (const item of allItems) {
-    if (duplicateKeys.has(item.normalizedKey)) {
+    if (duplicateKeys.has(getItemKey(item))) {
       item.status = item.status === "unknown" ? "unknown" : "duplicate";
     }
   }
@@ -293,11 +460,12 @@ function findDuplicateKeys(items) {
   const duplicates = new Set();
 
   for (const item of items) {
-    if (!item.normalizedKey) continue;
-    if (seen.has(item.normalizedKey)) {
-      duplicates.add(item.normalizedKey);
+    const key = getItemKey(item);
+    if (!key) continue;
+    if (seen.has(key)) {
+      duplicates.add(key);
     } else {
-      seen.add(item.normalizedKey);
+      seen.add(key);
     }
   }
 
@@ -434,8 +602,11 @@ function getListingDateValue(listing) {
   return Number.isNaN(time) ? 0 : time;
 }
 
-function getItemKey(item) {
-  return item?.normalizedKey || normalizeStickerKey(item?.key || item?.rawKey);
+export function getItemKey(item) {
+  return String(item?.catalogId ?? "").trim()
+    || getCatalogIdFromImagePath(item?.imagePath)
+    || item?.normalizedKey
+    || normalizeStickerKey(item?.key || item?.rawKey);
 }
 
 function findPersonalListingMatches(listings, formData, options = {}) {
