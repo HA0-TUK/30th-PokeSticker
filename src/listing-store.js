@@ -1,14 +1,20 @@
 import { firebaseConfig, firebaseOptions } from "./firebase-config.js";
-import { stickers } from "./catalog-data.js";
 import {
   CATALOG_SCHEMA_VERSION,
-  canonicalizeListingData,
-  collectGroupItemKeys,
-  compactGroupsForStorage,
-  createCatalogIndex,
   createListingOwnerKey,
   upsertPersonalListing,
 } from "./importer.js";
+import {
+  collectGroupKeys,
+  compactListingDetailForStorage,
+  compactListingForStorage,
+  mergeListingDetail,
+  normalizeListingBody,
+  normalizeListingCatalogFields,
+  normalizeRemoteListing,
+  normalizeRemoteListingDetail,
+  normalizeStoredImageMetadata,
+} from "./listing-schema.js";
 
 const FIREBASE_SDK_VERSION = "12.7.0";
 const LISTINGS_KEY = "pokemon-market-listings";
@@ -17,15 +23,20 @@ const FIREBASE_UID_KEY = "pokemon-market-firebase-uid";
 export const LISTINGS_REFRESH_KEY = "pokemon-market-listings-refresh";
 export const LISTINGS_BROADCAST_CHANNEL = "pokemon-market-listings";
 const LISTINGS_COLLECTION = "listings";
+const LISTING_DETAILS_COLLECTION = "listingDetails";
 const DELETED_LISTINGS_COLLECTION = "deletedListings";
+const LISTING_SECRETS_COLLECTION = "listingSecrets";
+const LISTING_CONTROL_GRANTS_COLLECTION = "listingControlGrants";
+const LISTING_CONTROL_GRANT_UIDS_COLLECTION = "uids";
 const META_COLLECTION = "meta";
 const LISTINGS_META_DOCUMENT = "listings";
 const IMAGE_FOLDER = "listing-images";
-const SYNC_CACHE_VERSION = 3;
+const SYNC_CACHE_VERSION = 5;
 const INCREMENTAL_SYNC_MAX_AGE_DAYS = 25;
 export const DEFAULT_LISTINGS_PAGE_SIZE = 10;
 const STORAGE_CACHE_CONTROL = "public,max-age=31536000,immutable";
-const catalogIndex = createCatalogIndex(stickers);
+const CONTROL_PIN_HASH_ITERATIONS = 120000;
+const CONTROL_PIN_HASH_ALGORITHM = "PBKDF2-SHA256";
 
 let firebaseStatePromise = null;
 let firebaseReadStatePromise = null;
@@ -160,7 +171,9 @@ export async function loadPersonalListing() {
       return null;
     }
 
-    const listing = normalizeRemoteListing(snapshot.id, snapshot.data());
+    const summaryListing = normalizeRemoteListing(snapshot.id, snapshot.data());
+    const detail = await loadRemoteListingDetail(firebase, user.uid);
+    const listing = mergeListingDetail(summaryListing, detail);
     if (listing.active === false) {
       saveLocalListings(remaining, loadLocalSyncState());
       return null;
@@ -172,6 +185,202 @@ export async function loadPersonalListing() {
     console.warn("내 교환 글을 불러오지 못했습니다.", error);
     return null;
   }
+}
+
+export async function loadListingWithDetails(listingOrId) {
+  const listingId = normalizeListingId(typeof listingOrId === "string" ? listingOrId : listingOrId?.id);
+  if (!listingId) return typeof listingOrId === "object" && listingOrId ? normalizeListingCatalogFields(listingOrId) : null;
+
+  const firebase = await getFirebaseReadState();
+  if (!firebase) {
+    const localListing = typeof listingOrId === "object" && listingOrId
+      ? listingOrId
+      : loadLocalListings().find((listing) => listing.id === listingId);
+    return localListing ? normalizeListingCatalogFields(localListing) : null;
+  }
+
+  const baseListing = typeof listingOrId === "object" && listingOrId
+    ? normalizeListingCatalogFields(listingOrId)
+    : await loadRemoteListingById(firebase, listingId);
+  if (!baseListing) return null;
+
+  const detail = await loadRemoteListingDetail(firebase, listingId);
+  return mergeListingDetail(baseListing, detail);
+}
+
+export function isValidControlPin(pin) {
+  return /^\d{4}$/.test(String(pin ?? "").trim());
+}
+
+export async function ensureListingControl(listingId, pin = "", options = {}) {
+  const normalizedListingId = normalizeListingId(listingId);
+  if (!normalizedListingId) throw createControlError("missing-listing", "게시글을 찾을 수 없습니다.");
+
+  const firebase = await getFirebaseState();
+  if (!firebase) throw createControlError("firebase-disabled", "Firebase 연결이 필요합니다.");
+
+  const user = firebase.auth.currentUser || (await firebase.signInAnonymously(firebase.auth)).user;
+  let listing = normalizeKnownListingForControl(options.knownListing, normalizedListingId);
+  if (listing && (listing.ownerUid === user.uid || listing.id === user.uid)) {
+    return { listing, granted: false, owner: true };
+  }
+
+  if (!listing) {
+    listing = await loadRemoteListingById(firebase, normalizedListingId);
+  }
+  if (!listing) throw createControlError("missing-listing", "게시글을 찾을 수 없습니다.");
+  if (listing.ownerUid === user.uid || listing.id === user.uid) {
+    return { listing, granted: false, owner: true };
+  }
+
+  if (!hasUsableControlPinFields(listing) && options.knownListing) {
+    listing = await loadRemoteListingById(firebase, normalizedListingId);
+    if (!listing) throw createControlError("missing-listing", "寃뚯떆湲??李얠쓣 ???놁뒿?덈떎.");
+    if (listing.ownerUid === user.uid || listing.id === user.uid) {
+      return { listing, granted: false, owner: true };
+    }
+  }
+
+  if (!listing.hasControlPin || !listing.controlSalt || !listing.pinVersion) {
+    throw createControlError("pin-unavailable", "이 게시글은 아직 관리 PIN이 설정되지 않아 다른 브라우저에서 제어할 수 없습니다.");
+  }
+
+  const normalizedPin = normalizeControlPin(pin);
+  if (!normalizedPin) throw createControlError("pin-required", "게시글 관리 PIN을 입력하세요.");
+  if (!isValidControlPin(normalizedPin)) {
+    throw createControlError("pin-format", "게시글 관리 PIN은 숫자 4자리여야 합니다.");
+  }
+
+  const pinHash = await hashControlPin(normalizedPin, listing.controlSalt);
+  const now = new Date().toISOString();
+  const grantRef = firebase.doc(
+    firebase.db,
+    LISTING_CONTROL_GRANTS_COLLECTION,
+    normalizedListingId,
+    LISTING_CONTROL_GRANT_UIDS_COLLECTION,
+    user.uid,
+  );
+
+  try {
+    await firebase.setDoc(grantRef, {
+      listingId: normalizedListingId,
+      uid: user.uid,
+      ownerUid: listing.ownerUid || "",
+      pinHash,
+      pinVersion: Number(listing.pinVersion),
+      grantedAt: now,
+      updatedAt: now,
+    });
+  } catch (error) {
+    throw createControlError("pin-invalid", "관리 PIN이 일치하지 않습니다.");
+  }
+
+  const updatedListing = await transferListingOwnerToCurrentUser(firebase, listing, user.uid, now);
+  return { listing: updatedListing, granted: true, owner: true, ownershipUpdated: true };
+}
+
+function normalizeKnownListingForControl(listing, listingId) {
+  if (!listing || listing.id !== listingId) return null;
+  return normalizeListingCatalogFields(listing);
+}
+
+function hasUsableControlPinFields(listing) {
+  return Boolean(listing?.hasControlPin && listing?.controlSalt && listing?.pinVersion);
+}
+
+async function transferListingOwnerToCurrentUser(firebase, listing, nextOwnerUid, updatedAt) {
+  if (!listing?.id || !nextOwnerUid || listing.ownerUid === nextOwnerUid) return listing;
+
+  const listingRef = firebase.doc(firebase.db, LISTINGS_COLLECTION, listing.id);
+  const secretRef = firebase.doc(firebase.db, LISTING_SECRETS_COLLECTION, listing.id);
+  const listingPatch = { ownerUid: nextOwnerUid };
+  const secretPatch = { ownerUid: nextOwnerUid, updatedAt };
+
+  if (firebase.writeBatch) {
+    const batch = firebase.writeBatch(firebase.db);
+    batch.set(listingRef, listingPatch, { merge: true });
+    batch.set(secretRef, secretPatch, { merge: true });
+    await batch.commit();
+  } else {
+    await firebase.setDoc(listingRef, listingPatch, { merge: true });
+    await firebase.setDoc(secretRef, secretPatch, { merge: true });
+  }
+
+  const updatedListing = {
+    ...listing,
+    ownerUid: nextOwnerUid,
+  };
+  rememberFirebaseUid(nextOwnerUid);
+  updateLocalListingCache(updatedListing);
+  return updatedListing;
+}
+
+function rememberFirebaseUid(uid) {
+  try {
+    localStorage.setItem(FIREBASE_UID_KEY, uid);
+  } catch {
+    // Browser key persistence is a convenience; Firestore ownerUid is the source of truth.
+  }
+}
+
+function updateLocalListingCache(updatedListing) {
+  const localListings = loadLocalListings();
+  let found = false;
+  const nextListings = localListings.map((listing) => {
+    if (listing.id !== updatedListing.id) return listing;
+    found = true;
+    return updatedListing;
+  });
+
+  if (!found) nextListings.unshift(updatedListing);
+  saveLocalListings(nextListings, createListingsSyncState(nextListings, null, loadLocalSyncState()));
+}
+
+export async function deleteControlledListing(listingId) {
+  const normalizedListingId = normalizeListingId(listingId);
+  if (!normalizedListingId) throw new Error("삭제할 게시글을 찾을 수 없습니다.");
+
+  const firebase = await getFirebaseState();
+  if (!firebase) {
+    const remaining = loadLocalListings().filter((listing) => listing.id !== normalizedListingId);
+    saveLocalListings(remaining, createListingsSyncState(remaining, null, loadLocalSyncState()));
+    announceListingsChanged({ action: "deleted-local", listingId: normalizedListingId });
+    return;
+  }
+
+  const user = firebase.auth.currentUser || (await firebase.signInAnonymously(firebase.auth)).user;
+  const listingRef = firebase.doc(firebase.db, LISTINGS_COLLECTION, normalizedListingId);
+  const detailRef = firebase.doc(firebase.db, LISTING_DETAILS_COLLECTION, normalizedListingId);
+  const deletionRef = firebase.doc(firebase.db, DELETED_LISTINGS_COLLECTION, normalizedListingId);
+  const existingSnapshot = await firebase.getDoc(listingRef);
+  const existing = existingSnapshot.exists() ? normalizeRemoteListing(existingSnapshot.id, existingSnapshot.data()) : null;
+  const existingDetail = existing ? await loadRemoteListingDetail(firebase, normalizedListingId) : null;
+  const existingWithDetails = mergeListingDetail(existing, existingDetail);
+  const now = new Date().toISOString();
+
+  if (existing && existing.active !== false) {
+    const storagePaths = collectStoragePaths(existingWithDetails.images);
+    const nextRevision = await writeListingDeletionAndMeta(firebase, listingRef, detailRef, deletionRef, {
+      listingId: normalizedListingId,
+      ownerUid: existing.ownerUid || normalizedListingId,
+      deletedByUid: user.uid,
+      deletedAt: now,
+      updatedAt: now,
+      storagePaths,
+      storageBytes: sumImageSizes(existingWithDetails.images),
+    }, now);
+    await refreshRemoteListingsCount(firebase, nextRevision);
+  }
+
+  const remaining = loadLocalListings().filter((listing) =>
+    listing.id !== normalizedListingId && listing.ownerUid !== normalizedListingId,
+  );
+  saveLocalListings(remaining, createListingsSyncState(remaining, null, loadLocalSyncState()));
+  announceListingsChanged({
+    action: "deleted",
+    listingId: normalizedListingId,
+    updatedAt: now,
+  });
 }
 
 export async function resolveListingShareTarget(listingId, pageSize = DEFAULT_LISTINGS_PAGE_SIZE) {
@@ -373,7 +582,10 @@ export async function savePersonalListing(draftListing, formData, options = {}) 
   const firebase = await getFirebaseState();
 
   if (!firebase) {
-    const normalizedDraftListing = normalizeListingCatalogFields(draftListing);
+    const normalizedDraftListing = normalizeListingCatalogFields({
+      ...draftListing,
+      body: normalizeListingBody(draftListing?.body),
+    });
     const result = upsertPersonalListing(loadLocalListings(), normalizedDraftListing, formData, options);
     saveLocalListings(result.listings);
     announceListingsChanged({ action: result.action || "saved", listingId: result.listing?.id || "" });
@@ -381,39 +593,66 @@ export async function savePersonalListing(draftListing, formData, options = {}) 
   }
 
   const user = firebase.auth.currentUser || (await firebase.signInAnonymously(firebase.auth)).user;
-  const listingRef = firebase.doc(firebase.db, LISTINGS_COLLECTION, user.uid);
+  const requestedListingId = normalizeListingId(options.knownListingId);
+  const listingId = requestedListingId || user.uid;
+  const listingRef = firebase.doc(firebase.db, LISTINGS_COLLECTION, listingId);
+  const detailRef = firebase.doc(firebase.db, LISTING_DETAILS_COLLECTION, listingId);
+  const secretRef = firebase.doc(firebase.db, LISTING_SECRETS_COLLECTION, listingId);
   
   // 최신 상태 확인 필요: 이미지 diff 계산, 중복 저장 방지
   const existingSnapshot = await firebase.getDoc(listingRef);
   const existing = existingSnapshot.exists() ? normalizeRemoteListing(existingSnapshot.id, existingSnapshot.data()) : null;
+  const existingDetail = existing ? await loadRemoteListingDetail(firebase, listingId) : null;
+  const existingWithDetails = mergeListingDetail(existing, existingDetail);
   const existingIsActive = Boolean(existing && existing.active !== false);
   const now = new Date().toISOString();
-  const images = await prepareRemoteImages(firebase, user.uid, draftListing.images ?? (draftListing.image ? [draftListing.image] : []));
-  const obsoleteStoragePaths = collectObsoleteStoragePaths(existing?.images, images);
+  const uploadImages = collectListingUploadImages(draftListing, formData);
+  const images = await prepareRemoteImages(firebase, user.uid, uploadImages);
+  const obsoleteStoragePaths = collectObsoleteStoragePaths(existingWithDetails?.images, images)
+    .filter((storagePath) => isUserStoragePath(storagePath, user.uid));
   const normalizedDraftListing = normalizeListingCatalogFields(draftListing);
+  const ownerUid = existing?.ownerUid || user.uid;
+  const controlPin = await prepareControlPinFields(formData?.controlPin, existing, ownerUid, now);
 
   const listing = {
     ...(existingIsActive ? existing : {}),
     ...normalizedDraftListing,
-    id: user.uid,
-    ownerUid: user.uid,
+    ...controlPin.listingFields,
+    id: listingId,
+    ownerUid,
     ownerKey: createListingOwnerKey(formData ?? draftListing),
+    body: normalizeListingBody(normalizedDraftListing.body),
     active: true,
     deletedAt: null,
     images,
     image: images[0] ?? null,
+    firstImage: images[0] ?? null,
+    imageCount: images.length,
+    wantedIds: collectGroupKeys(normalizedDraftListing.wantedGroups),
+    ownedIds: collectGroupKeys(normalizedDraftListing.ownedGroups),
     wantedKeys: collectGroupKeys(normalizedDraftListing.wantedGroups),
     ownedKeys: collectGroupKeys(normalizedDraftListing.ownedGroups),
     catalogSchemaVersion: CATALOG_SCHEMA_VERSION,
     createdAt: existingIsActive ? existing.createdAt : draftListing.createdAt || now,
     updatedAt: now,
   };
-  const nextRevision = await writeListingAndMeta(firebase, listingRef, compactListingForStorage(listing), now);
+  const secret = controlPin.secret
+    ? {
+        ...controlPin.secret,
+        ownerUid,
+      }
+    : null;
+  const nextRevision = await writeListingAndMeta(firebase, listingRef, compactListingForStorage(listing), now, {
+    detailRef,
+    detail: compactListingDetailForStorage(listing),
+    secretRef,
+    secret,
+  });
   await refreshRemoteListingsCount(firebase, nextRevision);
   await deleteStoragePaths(firebase, obsoleteStoragePaths);
 
   const localResult = upsertPersonalListing(loadLocalListings(), listing, formData ?? listing, {
-    knownListingId: user.uid,
+    knownListingId: listingId,
   });
   const localListings = [listing, ...localResult.listings.filter((localListing) => localListing.id !== listing.id)];
   saveLocalListings(localListings, createListingsSyncState(localListings, null, loadLocalSyncState()));
@@ -430,6 +669,44 @@ export async function savePersonalListing(draftListing, formData, options = {}) 
   };
 }
 
+function collectListingUploadImages(draftListing = {}, formData = {}) {
+  const draftImages = getListingImageList(draftListing);
+  const formImages = getListingImageList(formData);
+  return mergeListingImageLists(formImages, draftImages);
+}
+
+function getListingImageList(source = {}) {
+  if (Array.isArray(source?.images)) return source.images.filter(Boolean);
+  return source?.image ? [source.image] : [];
+}
+
+function mergeListingImageLists(...imageLists) {
+  const seen = new Set();
+  const merged = [];
+
+  for (const image of imageLists.flat()) {
+    if (!image) continue;
+    const key = getListingImageIdentity(image);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(image);
+  }
+
+  return merged;
+}
+
+function getListingImageIdentity(image) {
+  return [
+    image.storagePath || "",
+    image.url || "",
+    image.dataUrl || "",
+    image.name || image.originalName || "",
+    image.size || image.originalSize || "",
+    image.width || "",
+    image.height || "",
+  ].join("|");
+}
+
 export async function deletePersonalListing() {
   const firebase = await getFirebaseState();
 
@@ -442,20 +719,23 @@ export async function deletePersonalListing() {
 
   const user = firebase.auth.currentUser || (await firebase.signInAnonymously(firebase.auth)).user;
   const listingRef = firebase.doc(firebase.db, LISTINGS_COLLECTION, user.uid);
+  const detailRef = firebase.doc(firebase.db, LISTING_DETAILS_COLLECTION, user.uid);
   const deletionRef = firebase.doc(firebase.db, DELETED_LISTINGS_COLLECTION, user.uid);
   const existingSnapshot = await firebase.getDoc(listingRef);
   const existing = existingSnapshot.exists() ? normalizeRemoteListing(existingSnapshot.id, existingSnapshot.data()) : null;
+  const existingDetail = existing ? await loadRemoteListingDetail(firebase, user.uid) : null;
+  const existingWithDetails = mergeListingDetail(existing, existingDetail);
   const now = new Date().toISOString();
 
   if (existing && existing.active !== false) {
-    const storagePaths = collectStoragePaths(existing.images);
-    const nextRevision = await writeListingDeletionAndMeta(firebase, listingRef, deletionRef, {
+    const storagePaths = collectStoragePaths(existingWithDetails.images);
+    const nextRevision = await writeListingDeletionAndMeta(firebase, listingRef, detailRef, deletionRef, {
       listingId: user.uid,
       ownerUid: user.uid,
       deletedAt: now,
       updatedAt: now,
       storagePaths,
-      storageBytes: sumImageSizes(existing.images),
+      storageBytes: sumImageSizes(existingWithDetails.images),
     }, now);
     await refreshRemoteListingsCount(firebase, nextRevision);
   }
@@ -467,6 +747,103 @@ export async function deletePersonalListing() {
     listingId: user.uid,
     updatedAt: now,
   });
+}
+
+async function prepareControlPinFields(pin, existing, ownerUid, now) {
+  const normalizedPin = normalizeControlPin(pin);
+  if (normalizedPin && !isValidControlPin(normalizedPin)) {
+    throw new Error("게시글 관리 PIN은 숫자 4자리여야 합니다.");
+  }
+
+  if (!normalizedPin && existing?.hasControlPin && existing?.controlSalt && existing?.pinVersion) {
+    return {
+      listingFields: {
+        hasControlPin: true,
+        controlSalt: existing.controlSalt,
+        pinVersion: Number(existing.pinVersion),
+      },
+      secret: null,
+    };
+  }
+
+  if (!normalizedPin) {
+    throw new Error("게시글 관리를 위해 숫자 4자리 PIN을 입력하세요.");
+  }
+
+  const controlSalt = createControlSalt();
+  const pinVersion = createPinVersion();
+  const pinHash = await hashControlPin(normalizedPin, controlSalt);
+
+  return {
+    listingFields: {
+      hasControlPin: true,
+      controlSalt,
+      pinVersion,
+    },
+    secret: {
+      ownerUid,
+      pinHash,
+      pinVersion,
+      algorithm: CONTROL_PIN_HASH_ALGORITHM,
+      iterations: CONTROL_PIN_HASH_ITERATIONS,
+      ...(existing?.hasControlPin ? {} : { createdAt: now }),
+      updatedAt: now,
+    },
+  };
+}
+
+function normalizeControlPin(pin) {
+  return String(pin ?? "").trim();
+}
+
+function createPinVersion() {
+  return Date.now();
+}
+
+function createControlSalt() {
+  const bytes = new Uint8Array(16);
+  globalThis.crypto.getRandomValues(bytes);
+  return bytesToBase64Url(bytes);
+}
+
+async function hashControlPin(pin, salt) {
+  if (!globalThis.crypto?.subtle) {
+    throw new Error("이 브라우저에서는 게시글 관리 PIN을 사용할 수 없습니다.");
+  }
+
+  const encoder = new TextEncoder();
+  const key = await globalThis.crypto.subtle.importKey(
+    "raw",
+    encoder.encode(String(pin)),
+    "PBKDF2",
+    false,
+    ["deriveBits"],
+  );
+  const bits = await globalThis.crypto.subtle.deriveBits(
+    {
+      name: "PBKDF2",
+      hash: "SHA-256",
+      salt: encoder.encode(String(salt)),
+      iterations: CONTROL_PIN_HASH_ITERATIONS,
+    },
+    key,
+    256,
+  );
+  return `${CONTROL_PIN_HASH_ALGORITHM}:${CONTROL_PIN_HASH_ITERATIONS}:${salt}:${bytesToBase64Url(new Uint8Array(bits))}`;
+}
+
+function bytesToBase64Url(bytes) {
+  let binary = "";
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function createControlError(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
 }
 
 function announceListingsChanged(detail = {}) {
@@ -542,7 +919,7 @@ async function initializeFirebaseReadState() {
     db: firestoreModule.getFirestore(app),
     collection: firestoreModule.collection,
     doc: firestoreModule.doc,
-    getCount: firestoreModule.getCount,
+    getCountFromServer: firestoreModule.getCountFromServer,
     getDoc: firestoreModule.getDoc,
     getDocs: firestoreModule.getDocs,
     limit: firestoreModule.limit,
@@ -598,7 +975,7 @@ async function initializeFirebaseState() {
     increment: firestoreModule.increment,
     getDoc: firestoreModule.getDoc,
     getDocs: firestoreModule.getDocs,
-    getCount: firestoreModule.getCount,
+    getCountFromServer: firestoreModule.getCountFromServer,
     query: firestoreModule.query,
     runTransaction: firestoreModule.runTransaction,
     setDoc: firestoreModule.setDoc,
@@ -658,7 +1035,7 @@ async function prepareRemoteImage(firebase, ownerUid, image, index = 0, uploadBa
 }
 
 function createStoredImageMetadata(image, index = 0) {
-  return {
+  return normalizeStoredImageMetadata({
     name: image.name || image.originalName || "attachment",
     type: image.type || image.originalType || "image/png",
     url: image.url,
@@ -673,7 +1050,7 @@ function createStoredImageMetadata(image, index = 0) {
     width: Number.isFinite(Number(image.width)) ? Number(image.width) : null,
     height: Number.isFinite(Number(image.height)) ? Number(image.height) : null,
     order: Number.isFinite(Number(image.order)) ? Number(image.order) : index,
-  };
+  }, index);
 }
 
 function canvasToBlob(canvas, type, quality) {
@@ -734,6 +1111,10 @@ function collectImageStoragePaths(image) {
   return paths;
 }
 
+function isUserStoragePath(storagePath, uid) {
+  return String(storagePath || "").startsWith(`${IMAGE_FOLDER}/${uid}/`);
+}
+
 async function deleteStoragePaths(firebase, storagePaths) {
   const results = await Promise.allSettled((storagePaths || []).map(async (storagePath) => {
     try {
@@ -773,6 +1154,14 @@ async function loadRemoteListingById(firebase, listingId) {
 
   const listing = normalizeRemoteListing(snapshot.id, snapshot.data());
   return listing.active === false ? null : listing;
+}
+
+async function loadRemoteListingDetail(firebase, listingId) {
+  const normalizedListingId = normalizeListingId(listingId);
+  if (!normalizedListingId) return null;
+
+  const snapshot = await firebase.getDoc(firebase.doc(firebase.db, LISTING_DETAILS_COLLECTION, normalizedListingId));
+  return snapshot.exists() ? normalizeRemoteListingDetail(snapshot.id, snapshot.data()) : null;
 }
 
 async function loadAllRemoteListings(firebase) {
@@ -817,8 +1206,8 @@ async function countRemoteListingsNewerThan(firebase, listing) {
   const createdAt = normalizeOptionalDateValue(listing?.createdAt);
   if (!createdAt) return 0;
 
-  if (firebase.getCount) {
-    const snapshot = await firebase.getCount(
+  if (firebase.getCountFromServer) {
+    const snapshot = await firebase.getCountFromServer(
       firebase.query(
         firebase.collection(firebase.db, LISTINGS_COLLECTION),
         firebase.where("createdAt", ">", createdAt),
@@ -828,7 +1217,7 @@ async function countRemoteListingsNewerThan(firebase, listing) {
     return Number.isFinite(count) ? count : 0;
   }
 
-  const listings = sortListingsByCreatedAtDesc(await loadAllRemoteListings(firebase));
+  const listings = sortListingsByCreatedAtDesc(loadLocalListings());
   const index = listings.findIndex((candidate) => candidate.id === listing.id);
   return index >= 0 ? index : 0;
 }
@@ -845,18 +1234,29 @@ async function loadRemoteDeletedListingChanges(firebase, lastSyncAt) {
 }
 
 async function loadRemoteListingsCount(firebase) {
-  if (firebase.getCount) {
-    const snapshot = await firebase.getCount(firebase.collection(firebase.db, LISTINGS_COLLECTION));
+  if (firebase.getCountFromServer) {
+    const snapshot = await firebase.getCountFromServer(
+      firebase.query(
+        firebase.collection(firebase.db, LISTINGS_COLLECTION),
+        firebase.where("active", "==", true),
+      ),
+    );
     const count = Number(snapshot.data()?.count ?? 0);
     return Number.isFinite(count) ? count : 0;
   }
 
-  return (await loadAllRemoteListings(firebase)).length;
+  const remoteMeta = await loadRemoteListingsMeta(firebase);
+  if (remoteMeta?.activeCount != null && Number.isFinite(Number(remoteMeta.activeCount))) {
+    return Number(remoteMeta.activeCount);
+  }
+
+  return null;
 }
 
 async function refreshRemoteListingsCount(firebase, expectedRevision = null) {
   try {
     const activeCount = await loadRemoteListingsCount(firebase);
+    if (activeCount == null) return false;
     const metaRef = firebase.doc(firebase.db, META_COLLECTION, LISTINGS_META_DOCUMENT);
     const countedAt = new Date().toISOString();
     const normalizedExpectedRevision = Number(expectedRevision);
@@ -887,8 +1287,9 @@ async function refreshRemoteListingsCount(firebase, expectedRevision = null) {
   }
 }
 
-async function writeListingAndMeta(firebase, listingRef, listing, updatedAt) {
+async function writeListingAndMeta(firebase, listingRef, listing, updatedAt, options = {}) {
   const metaRef = firebase.doc(firebase.db, META_COLLECTION, LISTINGS_META_DOCUMENT);
+  const { detailRef = null, detail = null, secretRef = null, secret = null } = options;
 
   if (firebase.runTransaction) {
     return firebase.runTransaction(firebase.db, async (transaction) => {
@@ -896,6 +1297,8 @@ async function writeListingAndMeta(firebase, listingRef, listing, updatedAt) {
       const nextRevision = getNextRevision(metaSnapshot);
 
       transaction.set(listingRef, listing);
+      if (detailRef && detail) transaction.set(detailRef, detail);
+      if (secretRef && secret) transaction.set(secretRef, secret, { merge: true });
       transaction.set(metaRef, {
         revision: nextRevision,
         updatedAt,
@@ -913,17 +1316,21 @@ async function writeListingAndMeta(firebase, listingRef, listing, updatedAt) {
   if (firebase.writeBatch) {
     const batch = firebase.writeBatch(firebase.db);
     batch.set(listingRef, listing);
+    if (detailRef && detail) batch.set(detailRef, detail);
+    if (secretRef && secret) batch.set(secretRef, secret, { merge: true });
     batch.set(metaRef, metaPatch, { merge: true });
     await batch.commit();
     return null;
   }
 
   await firebase.setDoc(listingRef, listing);
+  if (detailRef && detail) await firebase.setDoc(detailRef, detail);
+  if (secretRef && secret) await firebase.setDoc(secretRef, secret, { merge: true });
   await firebase.setDoc(metaRef, metaPatch, { merge: true });
   return null;
 }
 
-async function writeListingDeletionAndMeta(firebase, listingRef, deletionRef, deletion, updatedAt) {
+async function writeListingDeletionAndMeta(firebase, listingRef, detailRef, deletionRef, deletion, updatedAt) {
   const metaRef = firebase.doc(firebase.db, META_COLLECTION, LISTINGS_META_DOCUMENT);
 
   if (firebase.runTransaction) {
@@ -932,6 +1339,7 @@ async function writeListingDeletionAndMeta(firebase, listingRef, deletionRef, de
       const nextRevision = getNextRevision(metaSnapshot);
 
       transaction.delete(listingRef);
+      if (detailRef) transaction.delete(detailRef);
       transaction.set(deletionRef, deletion, { merge: true });
       transaction.set(metaRef, {
         revision: nextRevision,
@@ -949,6 +1357,7 @@ async function writeListingDeletionAndMeta(firebase, listingRef, deletionRef, de
     };
     const batch = firebase.writeBatch(firebase.db);
     batch.delete(listingRef);
+    if (detailRef) batch.delete(detailRef);
     batch.set(deletionRef, deletion, { merge: true });
     batch.set(metaRef, metaPatch, { merge: true });
     await batch.commit();
@@ -956,6 +1365,7 @@ async function writeListingDeletionAndMeta(firebase, listingRef, deletionRef, de
   }
 
   await firebase.deleteDoc(listingRef);
+  if (detailRef) await firebase.deleteDoc(detailRef);
   await firebase.setDoc(deletionRef, deletion, { merge: true });
   await firebase.setDoc(metaRef, {
     revision: firebase.increment(1),
@@ -973,36 +1383,6 @@ function normalizeRevision(value) {
   const revision = Number(value || 0);
   if (!Number.isFinite(revision) || revision < 0) return 0;
   return Math.floor(revision);
-}
-
-function normalizeListingCatalogFields(listing = {}) {
-  return canonicalizeListingData(listing, catalogIndex);
-}
-
-function compactListingForStorage(listing = {}) {
-  return {
-    ...listing,
-    catalogSchemaVersion: CATALOG_SCHEMA_VERSION,
-    wantedGroups: compactGroupsForStorage(listing.wantedGroups, catalogIndex, "wanted"),
-    ownedGroups: compactGroupsForStorage(listing.ownedGroups, catalogIndex, "owned"),
-    wantedKeys: collectGroupKeys(listing.wantedGroups),
-    ownedKeys: collectGroupKeys(listing.ownedGroups),
-  };
-}
-
-function normalizeRemoteListing(id, data) {
-  const images = Array.isArray(data?.images) ? data.images : data?.image ? [data.image] : [];
-
-  return normalizeListingCatalogFields({
-    ...data,
-    id: data?.id || id,
-    active: data?.active !== false,
-    images,
-    image: images[0] ?? null,
-    createdAt: normalizeDateValue(data?.createdAt),
-    updatedAt: data?.updatedAt ? normalizeDateValue(data.updatedAt) : null,
-    deletedAt: data?.deletedAt ? normalizeDateValue(data.deletedAt) : null,
-  });
 }
 
 function normalizeRemoteDeletedListing(id, data) {
@@ -1039,10 +1419,6 @@ function normalizeOptionalDateValue(value) {
   if (typeof value === "string") return value;
   if (typeof value.toDate === "function") return value.toDate().toISOString();
   return String(value);
-}
-
-function collectGroupKeys(groups) {
-  return collectGroupItemKeys(groups);
 }
 
 function loadLocalListings() {

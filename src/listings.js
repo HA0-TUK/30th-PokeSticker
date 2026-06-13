@@ -7,16 +7,20 @@ import {
 } from "./importer.js";
 import {
   DEFAULT_LISTINGS_PAGE_SIZE,
+  deleteControlledListing,
   deletePersonalListing,
+  ensureListingControl,
   getListingStoreMode,
   LISTINGS_BROADCAST_CHANNEL,
   LISTINGS_REFRESH_KEY,
   loadCachedListings,
+  loadListingWithDetails,
   loadListingPage as loadStoredListingPage,
   resolveListingShareTarget,
 } from "./listing-store.js";
 
 const PROFILE_KEY = "pokemon-market-profile";
+const TRAINER_KEY = "pokemon-market-trainer";
 const LISTINGS_REFRESH_THROTTLE_MS = 5000;
 const LISTING_SHARE_PARAM = "listing";
 const catalogIndex = createCatalogIndex(stickers);
@@ -52,6 +56,7 @@ let lastRefreshStartedAt = 0;
 let listingsBroadcastChannel = null;
 let sharedListingId = getSharedListingId();
 let highlightedListingId = sharedListingId;
+let renderedListingsById = new Map();
 let paginationState = {
   pageIndex: 0,
   totalPages: 1,
@@ -104,7 +109,7 @@ window.addEventListener("keydown", (event) => {
 
   if (activeCarousel) {
     event.preventDefault();
-    stepCarousel(activeCarousel, event.key === "ArrowRight" ? 1 : -1);
+    stepCarouselWithDetails(activeCarousel, event.key === "ArrowRight" ? 1 : -1);
   }
 });
 modalCounter.className = "modal-count";
@@ -216,6 +221,7 @@ function setupListingsAutoRefresh() {
 
 function renderListingCards(listings, options = {}) {
   listingList.innerHTML = "";
+  renderedListingsById = new Map((listings || []).map((listing) => [listing.id, listing]));
 
   if (listings.length === 0) {
     const empty = document.createElement("div");
@@ -308,6 +314,138 @@ function setPaginationBusy(isBusy) {
   for (const button of listingPageButtons.querySelectorAll("button")) {
     button.disabled = isBusy;
   }
+}
+
+async function editControlledListing(listingId, knownListing = null) {
+  try {
+    const { listing } = await requestListingControl(listingId, knownListing);
+    if (!window.confirm("마이페이지의 내용을 해당 게시글로 덮어쓰겠습니다.")) return;
+
+    const listingWithDetails = await loadListingWithDetails(listing);
+    overwriteMypageFromListing(listingWithDetails || listing);
+    window.location.href = "./index.html";
+  } catch (error) {
+    if (error?.code === "pin-cancelled") return;
+    window.alert(error?.message || "게시글 제어권을 확인하지 못했습니다.");
+  }
+}
+
+async function deleteListingFromCard(listingId, knownListing = null) {
+  try {
+    await requestListingControl(listingId, knownListing);
+    if (!window.confirm("이 교환 글을 삭제할까요? 첨부 이미지는 재게시를 위해 유지됩니다.")) return;
+
+    await deleteControlledListing(listingId);
+    await renderListings(paginationState.pageIndex || 0);
+  } catch (error) {
+    if (error?.code === "pin-cancelled") return;
+    window.alert(error?.message || "게시글을 삭제하지 못했습니다.");
+  }
+}
+
+async function requestListingControl(listingId, knownListing = null) {
+  try {
+    return await ensureListingControl(listingId, "", { knownListing });
+  } catch (error) {
+    if (!["pin-required", "pin-invalid", "pin-format"].includes(error?.code)) throw error;
+  }
+
+  const pin = await requestControlPin();
+  return ensureListingControl(listingId, pin, { knownListing });
+}
+
+function requestControlPin() {
+  const dialog = getControlPinDialog();
+  const form = dialog.querySelector("form");
+  const input = dialog.querySelector("input");
+  const cancelButton = dialog.querySelector("[data-pin-cancel]");
+
+  input.value = "";
+  dialog.classList.remove("hidden");
+  input.focus();
+
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      form.removeEventListener("submit", handleSubmit);
+      cancelButton.removeEventListener("click", handleCancel);
+      dialog.classList.add("hidden");
+    };
+    const handleCancel = () => {
+      cleanup();
+      reject(createListingUiError("pin-cancelled", "PIN 입력이 취소되었습니다."));
+    };
+    const handleSubmit = (event) => {
+      event.preventDefault();
+      const pin = input.value.trim();
+      if (!/^\d{4}$/.test(pin)) {
+        input.setCustomValidity("숫자 4자리를 입력하세요.");
+        input.reportValidity();
+        input.setCustomValidity("");
+        return;
+      }
+      cleanup();
+      resolve(pin);
+    };
+
+    form.addEventListener("submit", handleSubmit);
+    cancelButton.addEventListener("click", handleCancel);
+  });
+}
+
+function getControlPinDialog() {
+  let dialog = document.getElementById("controlPinDialog");
+  if (dialog) return dialog;
+
+  dialog = document.createElement("div");
+  dialog.id = "controlPinDialog";
+  dialog.className = "control-pin-dialog hidden";
+  dialog.setAttribute("role", "dialog");
+  dialog.setAttribute("aria-modal", "true");
+  dialog.innerHTML = `
+    <form class="control-pin-box">
+      <h2>게시글 관리 PIN</h2>
+      <label class="field">
+        <span>숫자 4자리</span>
+        <input type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="4" pattern="[0-9]{4}" required />
+      </label>
+      <div class="actions">
+        <button type="submit">확인</button>
+        <button type="button" class="secondary" data-pin-cancel>취소</button>
+      </div>
+    </form>
+  `;
+  dialog.querySelector("input").addEventListener("input", (event) => {
+    event.target.value = event.target.value.replace(/\D+/g, "").slice(0, 4);
+  });
+  document.body.append(dialog);
+  return dialog;
+}
+
+function overwriteMypageFromListing(listing) {
+  const now = new Date().toISOString();
+  localStorage.setItem(PROFILE_KEY, JSON.stringify({
+    source: "controlled-listing",
+    importedAt: now,
+    haveLayoutMode: "split",
+    wantedGroups: listing?.wantedGroups || [],
+    ownedGroups: listing?.ownedGroups || [],
+    rawData: null,
+  }));
+  localStorage.setItem(TRAINER_KEY, JSON.stringify({
+    listingId: listing?.id || "",
+    hasControlPin: Boolean(listing?.hasControlPin),
+    nickname: listing?.nickname || "",
+    contact: listing?.contact || "",
+    body: listing?.body || "",
+    transferWilling: Boolean(listing?.transferWilling),
+    images: normalizeListingImages(listing).filter((image) => image && !image.generated),
+  }));
+}
+
+function createListingUiError(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
 }
 
 async function copyListingShareLink(listingId, button) {
@@ -405,9 +543,21 @@ function createListingCard(listing) {
   shareButton.dataset.listingShareId = listing.id || "";
   shareButton.textContent = "공유";
 
+  const editButton = document.createElement("button");
+  editButton.type = "button";
+  editButton.className = "secondary listing-control-button";
+  editButton.dataset.listingEditId = listing.id || "";
+  editButton.textContent = "수정";
+
+  const deleteButton = document.createElement("button");
+  deleteButton.type = "button";
+  deleteButton.className = "secondary listing-control-button danger";
+  deleteButton.dataset.listingDeleteId = listing.id || "";
+  deleteButton.textContent = "삭제";
+
   const headerActions = document.createElement("div");
   headerActions.className = "listing-header-actions";
-  headerActions.append(badge, shareButton);
+  headerActions.append(badge, shareButton, editButton, deleteButton);
   header.append(titleGroup, headerActions);
 
   const body = document.createElement("div");
@@ -468,8 +618,9 @@ function createListingGallery(images, listing) {
   const nextButton = createCarouselControl("›", "다음 이미지 보기", "next");
   const counter = document.createElement("span");
   counter.className = "carousel-count";
+  const displayImageCount = Math.max(images.length, Number(listing?.imageCount || 0));
 
-  const dotButtons = images.map((_, index) => {
+  const dotButtons = Array.from({ length: displayImageCount }, (_, index) => {
     const dotButton = document.createElement("button");
     dotButton.type = "button";
     dotButton.className = "carousel-dot";
@@ -480,12 +631,12 @@ function createListingGallery(images, listing) {
   });
 
   viewport.append(frameButton);
-  if (images.length > 1) {
+  if (displayImageCount > 1) {
     viewport.append(previousButton, nextButton, counter);
   }
 
   carousel.append(viewport);
-  if (images.length > 1) {
+  if (displayImageCount > 1) {
     const dots = document.createElement("div");
     dots.className = "carousel-dots";
     dots.append(...dotButtons);
@@ -502,6 +653,8 @@ function createListingGallery(images, listing) {
     image,
     images,
     listing,
+    detailLoaded: false,
+    detailLoading: null,
     loaded: false,
     startX: 0,
     swiped: false,
@@ -521,7 +674,25 @@ function createCarouselControl(text, label, direction) {
   return button;
 }
 
-function handleListingListClick(event) {
+async function handleListingListClick(event) {
+  const editButton = event.target.closest("[data-listing-edit-id]");
+  if (editButton) {
+    event.preventDefault();
+    event.stopPropagation();
+    const listingId = editButton.dataset.listingEditId;
+    editControlledListing(listingId, renderedListingsById.get(listingId) || null);
+    return;
+  }
+
+  const deleteButton = event.target.closest("[data-listing-delete-id]");
+  if (deleteButton) {
+    event.preventDefault();
+    event.stopPropagation();
+    const listingId = deleteButton.dataset.listingDeleteId;
+    deleteListingFromCard(listingId, renderedListingsById.get(listingId) || null);
+    return;
+  }
+
   const shareButton = event.target.closest("[data-listing-share-id]");
   if (shareButton) {
     event.preventDefault();
@@ -547,17 +718,18 @@ function handleListingListClick(event) {
       return;
     }
     ensureCarouselLoaded(carousel);
-    if (!getListingImageSource(state.images[state.activeIndex])) return;
-    showImageModal(state.images, state.activeIndex);
+    const modalImageList = await loadCarouselModalImages(carousel);
+    if (!getListingImageSource(modalImageList[state.activeIndex])) return;
+    showImageModal(modalImageList, state.activeIndex);
     return;
   }
 
   event.preventDefault();
   event.stopPropagation();
 
-  if (action === "previous") stepCarousel(carousel, -1);
-  if (action === "next") stepCarousel(carousel, 1);
-  if (action === "dot") setCarouselImage(carousel, Number(actionTarget.dataset.carouselIndex));
+  if (action === "previous") stepCarouselWithDetails(carousel, -1);
+  if (action === "next") stepCarouselWithDetails(carousel, 1);
+  if (action === "dot") setCarouselImageWithDetails(carousel, Number(actionTarget.dataset.carouselIndex));
 }
 
 function handleCarouselPointerDown(event) {
@@ -575,13 +747,14 @@ function handleCarouselPointerUp(event) {
   const viewport = event.target.closest(".listing-carousel-viewport");
   const carousel = viewport?.closest(".listing-carousel");
   const state = carousel ? carouselStates.get(carousel) : null;
-  if (!state || state.images.length <= 1) return;
+  const displayImageCount = Math.max(state?.images?.length || 0, Number(state?.listing?.imageCount || 0));
+  if (!state || displayImageCount <= 1) return;
 
   const deltaX = event.clientX - state.startX;
   if (Math.abs(deltaX) < 42) return;
 
   state.swiped = true;
-  stepCarousel(carousel, deltaX < 0 ? 1 : -1);
+  stepCarouselWithDetails(carousel, deltaX < 0 ? 1 : -1);
 }
 
 function handleCarouselMouseOver(event) {
@@ -613,6 +786,16 @@ function stepCarousel(carousel, direction) {
   setCarouselImage(carousel, state.activeIndex + direction);
 }
 
+async function stepCarouselWithDetails(carousel, direction) {
+  await loadCarouselModalImages(carousel);
+  stepCarousel(carousel, direction);
+}
+
+async function setCarouselImageWithDetails(carousel, nextIndex) {
+  await loadCarouselModalImages(carousel);
+  setCarouselImage(carousel, nextIndex);
+}
+
 function setCarouselImage(carousel, nextIndex) {
   const state = carouselStates.get(carousel);
   if (!state || state.images.length === 0) return;
@@ -631,7 +814,7 @@ function setCarouselImage(carousel, nextIndex) {
   state.frameButton.classList.toggle("missing-preview", !source);
   state.image.alt = listingImage.name || "첨부 이미지";
   state.frameButton.setAttribute("aria-label", `${state.activeIndex + 1}번째 첨부 이미지 크게 보기`);
-  state.counter.textContent = `${state.activeIndex + 1} / ${state.images.length}`;
+  state.counter.textContent = `${state.activeIndex + 1} / ${Math.max(state.images.length, Number(state.listing?.imageCount || 0))}`;
   state.loaded = true;
   state.dotButtons.forEach((dotButton, index) => {
     dotButton.classList.toggle("active", index === state.activeIndex);
@@ -684,6 +867,46 @@ function ensureCarouselLoaded(carousel) {
   const state = carouselStates.get(carousel);
   if (!state || state.loaded) return;
   setCarouselImage(carousel, state.activeIndex);
+}
+
+async function loadCarouselModalImages(carousel) {
+  const state = carouselStates.get(carousel);
+  if (!state) return [];
+  if (state.detailLoaded) return state.images;
+
+  const expectedImageCount = Number(state.listing?.imageCount || state.images.length || 0);
+  if (!shouldTryLoadListingDetails(state, expectedImageCount)) {
+    state.detailLoaded = true;
+    return state.images;
+  }
+
+  state.detailLoading ??= loadListingWithDetails(state.listing)
+    .then((listingWithDetails) => {
+      const images = normalizeListingImages(listingWithDetails);
+      if (listingWithDetails && images.length > 0) {
+        state.listing = listingWithDetails;
+        state.images = images;
+        renderedListingsById.set(listingWithDetails.id, listingWithDetails);
+      }
+      state.detailLoaded = true;
+      return state.images;
+    })
+    .catch((error) => {
+      console.warn("게시글 상세 이미지를 불러오지 못했습니다.", error);
+      state.detailLoaded = true;
+      return state.images;
+    })
+    .finally(() => {
+      state.detailLoading = null;
+    });
+
+  return state.detailLoading;
+}
+
+function shouldTryLoadListingDetails(state, expectedImageCount) {
+  if (!state?.listing?.id) return false;
+  if (expectedImageCount > state.images.length) return true;
+  return state.images.length <= 1;
 }
 
 function scheduleAdjacentImagePreload(images, activeIndex) {
@@ -820,6 +1043,7 @@ function createFallbackPreviewColumn(label, groups, type) {
 
 function normalizeListingImages(listing) {
   if (Array.isArray(listing?.images) && listing.images.length > 0) return listing.images;
+  if (listing?.firstImage) return [listing.firstImage];
   return listing?.image ? [listing.image] : [];
 }
 

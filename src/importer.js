@@ -1,7 +1,8 @@
 import { decompressFromBase64 } from "./lz-string.js";
 
 export const REFERENCE_SAVE_KEY = "poke-sheet-save-data";
-export const CATALOG_SCHEMA_VERSION = 2;
+export const CATALOG_SCHEMA_VERSION = 3;
+export const LISTING_BODY_MAX_LENGTH = 500;
 
 export function normalizeStickerKey(value) {
   return String(value ?? "")
@@ -21,8 +22,52 @@ function extractStickerNumber(value) {
   return String(value ?? "").trim().match(/^(\d{4})(?:[\s._-]|$)/)?.[1] || "";
 }
 
+function splitChecklistId(id) {
+  const [base, variant = "0"] = String(id ?? "").trim().split("_");
+  return {
+    base: Number(base),
+    variant: Number(variant),
+  };
+}
+
+function getDisplayIdFromChecklistId(id) {
+  const { base } = splitChecklistId(id);
+  return Number.isFinite(base) && base > 0 ? base : 0;
+}
+
+function getCatalogIdFromChecklistId(id) {
+  const value = String(id ?? "").trim();
+  if (!value) return "";
+  if (value === "25_1") return "0025";
+
+  const { base, variant } = splitChecklistId(value);
+  if (!Number.isFinite(base) || base <= 0) return "";
+
+  const paddedBase = String(base).padStart(4, "0");
+  return variant > 0 ? `${paddedBase}_${String(variant).padStart(2, "0")}` : paddedBase;
+}
+
+function getGeneration(displayId) {
+  if (displayId >= 1 && displayId <= 151) return "1";
+  if (displayId >= 152 && displayId <= 251) return "2";
+  if (displayId >= 252 && displayId <= 386) return "3";
+  if (displayId >= 387 && displayId <= 493) return "4";
+  if (displayId >= 494 && displayId <= 649) return "5";
+  if (displayId >= 650 && displayId <= 721) return "6";
+  if (displayId >= 722 && displayId <= 809) return "7";
+  if (displayId >= 810 && displayId <= 905) return "8";
+  if (displayId >= 906 && displayId <= 1025) return "9";
+  return "ETC";
+}
+
+function createCatalogKey(number, name) {
+  return `${number}.${name}`;
+}
+
 export function createCatalogIndex(stickers) {
   const byNormalizedKey = new Map();
+  const byId = new Map();
+  const bySourceId = new Map();
   const byCatalogId = new Map();
   const byImagePath = new Map();
   const byNumber = new Map();
@@ -30,21 +75,44 @@ export function createCatalogIndex(stickers) {
   const preparedStickers = [];
 
   for (const sticker of stickers ?? []) {
-    const normalizedKey = sticker.normalizedKey || normalizeStickerKey(sticker.key);
-    const catalogId = sticker.catalogId || getCatalogIdFromImagePath(sticker.imagePath);
-    const imagePath = normalizeImagePath(sticker.imagePath);
+    const rawImagePath = normalizeImagePath(sticker.imagePath || sticker.img);
+    const rawCatalogId = sticker.catalogId || getCatalogIdFromImagePath(rawImagePath);
+    const id = String(sticker.id || sticker.sourceId || rawCatalogId || "").trim();
+    const sourceId = String(sticker.sourceId || sticker.id || "").trim();
+    const catalogId = rawCatalogId || getCatalogIdFromChecklistId(id);
+    const displayId = Number(sticker.displayId || getDisplayIdFromChecklistId(id) || Number(sticker.number));
+    const number = String(sticker.number || (displayId ? String(displayId).padStart(4, "0") : catalogId.split("_")[0]) || "").trim();
+    const name = String(sticker.name || "").trim();
+    const key = sticker.key || createCatalogKey(number, name);
+    const normalizedKey = sticker.normalizedKey || normalizeStickerKey(key);
+    const imagePath = rawImagePath || (catalogId ? `/icons/${catalogId}.png` : "");
     const preparedSticker = {
       ...sticker,
+      id,
+      sourceId,
       catalogId,
+      key,
       normalizedKey,
+      number,
+      displayId,
+      name,
+      imagePath,
+      img: imagePath,
+      gen: sticker.gen || getGeneration(displayId),
     };
 
     preparedStickers.push(preparedSticker);
     byNormalizedKey.set(normalizedKey, preparedSticker);
+    if (id) byId.set(id, preparedSticker);
+    if (sourceId) bySourceId.set(sourceId, preparedSticker);
     if (catalogId) byCatalogId.set(catalogId, preparedSticker);
     if (imagePath) byImagePath.set(imagePath, preparedSticker);
+    const legacyIds = new Set([catalogId, ...(sticker.legacyIds || [])]);
+    for (const legacyId of legacyIds) {
+      const normalizedLegacyId = String(legacyId || "").trim();
+      if (normalizedLegacyId) byCatalogId.set(normalizedLegacyId, preparedSticker);
+    }
 
-    const number = String(sticker.number ?? "").trim();
     if (number) {
       const bucket = numberBuckets.get(number) || [];
       bucket.push(preparedSticker);
@@ -58,6 +126,8 @@ export function createCatalogIndex(stickers) {
 
   return {
     stickers: preparedStickers,
+    byId,
+    bySourceId,
     byCatalogId,
     byImagePath,
     byNormalizedKey,
@@ -78,8 +148,16 @@ export function findCatalogSticker(item, catalogIndex) {
 
   const rawValue = typeof item === "string" ? item : "";
   const catalogId = String(typeof item === "object" ? item.catalogId ?? "" : "").trim();
-  if (catalogId && catalogIndex.byCatalogId?.has(catalogId)) {
-    return catalogIndex.byCatalogId.get(catalogId);
+  const directIds = typeof item === "object"
+    ? [item.id, item.sourceId, item.checklistId, item.catalogId, item.rawKey, item.key]
+    : [rawValue];
+
+  for (const value of directIds) {
+    const directId = String(value ?? "").trim();
+    if (!directId) continue;
+    if (catalogIndex.byId?.has(directId)) return catalogIndex.byId.get(directId);
+    if (catalogIndex.bySourceId?.has(directId)) return catalogIndex.bySourceId.get(directId);
+    if (catalogIndex.byCatalogId?.has(directId)) return catalogIndex.byCatalogId.get(directId);
   }
 
   const imagePath = normalizeImagePath(typeof item === "object" ? item.imagePath : "");
@@ -118,11 +196,14 @@ export function canonicalizeStickerItem(item, catalogIndex, category = "owned") 
 
   const imagePath = source.imagePath ?? "";
   const catalogId = source.catalogId || getCatalogIdFromImagePath(imagePath);
-  const rawKey = source.rawKey ?? source.key ?? source.name ?? catalogId ?? "";
+  const id = String(source.id ?? source.sourceId ?? source.checklistId ?? "").trim();
+  const rawKey = source.rawKey ?? source.key ?? source.name ?? id ?? catalogId ?? "";
   const normalizedKey = source.normalizedKey || normalizeStickerKey(rawKey);
 
   return {
     ...source,
+    id,
+    sourceId: String(source.sourceId ?? id ?? "").trim(),
     rawKey: String(rawKey ?? ""),
     normalizedKey,
     key: String(source.key ?? rawKey ?? ""),
@@ -151,6 +232,8 @@ export function canonicalizeListingData(listing, catalogIndex) {
     catalogSchemaVersion: CATALOG_SCHEMA_VERSION,
     wantedGroups,
     ownedGroups,
+    wantedIds: collectGroupItemKeys(wantedGroups),
+    ownedIds: collectGroupItemKeys(ownedGroups),
     wantedKeys: collectGroupItemKeys(wantedGroups),
     ownedKeys: collectGroupItemKeys(ownedGroups),
   };
@@ -158,12 +241,12 @@ export function canonicalizeListingData(listing, catalogIndex) {
 
 export function compactStickerItemForStorage(item, catalogIndex, category = "owned") {
   const canonicalItem = canonicalizeStickerItem(item, catalogIndex, category);
-  if (canonicalItem.status !== "unknown" && canonicalItem.catalogId) {
-    return { catalogId: canonicalItem.catalogId };
+  if (canonicalItem.status !== "unknown" && canonicalItem.id) {
+    return { id: canonicalItem.id };
   }
 
   const compact = {};
-  for (const field of ["catalogId", "rawKey", "normalizedKey", "key", "name", "number", "imagePath", "status"]) {
+  for (const field of ["id", "sourceId", "catalogId", "rawKey", "normalizedKey", "key", "name", "number", "imagePath", "status"]) {
     if (canonicalItem[field] != null && String(canonicalItem[field]).trim()) {
       compact[field] = canonicalItem[field];
     }
@@ -246,8 +329,11 @@ export function refreshImportedData(importedData, catalogIndex = null) {
 export function makeStickerItem(sticker, category = "owned") {
   const normalizedKey = sticker?.normalizedKey || normalizeStickerKey(sticker?.key);
   const catalogId = sticker?.catalogId || getCatalogIdFromImagePath(sticker?.imagePath);
+  const id = String(sticker?.id || sticker?.sourceId || catalogId || "").trim();
 
   return {
+    id,
+    sourceId: String(sticker?.sourceId || sticker?.id || "").trim(),
     catalogId,
     rawKey: sticker?.key ?? "",
     normalizedKey,
@@ -264,9 +350,11 @@ export function validateDraftForPublish(importedData, formData) {
   const errors = [];
   const nickname = String(formData?.nickname ?? "").trim();
   const contact = String(formData?.contact ?? "").trim();
+  const body = String(formData?.body ?? "").trim();
 
   if (!nickname) errors.push("닉네임을 입력하세요.");
   if (!contact) errors.push("연락처를 입력하세요.");
+  if (body.length > LISTING_BODY_MAX_LENGTH) errors.push(`교환 글 본문은 ${LISTING_BODY_MAX_LENGTH}자 이하로 입력하세요.`);
   if (!importedData) errors.push("게시할 가져오기 데이터가 없습니다.");
 
   if ((importedData?.validation?.wantedCount ?? 0) + (importedData?.validation?.ownedCount ?? 0) < 1) {
@@ -299,7 +387,7 @@ export function buildListing(importedData, formData) {
     createdAt: new Date().toISOString(),
     nickname: String(formData.nickname).trim(),
     contact: String(formData.contact).trim(),
-    body: String(formData.body ?? "").trim(),
+    body: String(formData.body ?? "").trim().slice(0, LISTING_BODY_MAX_LENGTH),
     images: normalizeListingImages(formData),
     image: normalizeListingImages(formData)[0] ?? null,
     transferWilling: Boolean(formData.transferWilling),
@@ -603,7 +691,8 @@ function getListingDateValue(listing) {
 }
 
 export function getItemKey(item) {
-  return String(item?.catalogId ?? "").trim()
+  return String(item?.id ?? item?.sourceId ?? item?.checklistId ?? "").trim()
+    || String(item?.catalogId ?? "").trim()
     || getCatalogIdFromImagePath(item?.imagePath)
     || item?.normalizedKey
     || normalizeStickerKey(item?.key || item?.rawKey);

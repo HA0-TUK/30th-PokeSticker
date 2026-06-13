@@ -4,6 +4,7 @@ import {
   createCatalogIndex,
   findPersonalListing,
   getItemKey,
+  LISTING_BODY_MAX_LENGTH,
   makeStickerItem,
   normalizeStickerKey,
   parseReferenceInput,
@@ -13,6 +14,7 @@ import {
 import {
   clearListingCache,
   getListingStoreMode,
+  isValidControlPin,
   loadCachedListings,
   loadListings as loadStoredListings,
   loadPersonalListing,
@@ -38,6 +40,7 @@ const koreanNameCollator = new Intl.Collator("ko-KR", {
 });
 
 const catalogIndex = createCatalogIndex(stickers);
+const catalogItems = catalogIndex.stickers;
 let currentImport = refreshImportedData(loadProfile() || createEmptyProfile(), catalogIndex);
 let currentTrainer = loadTrainerInfo();
 let currentUserImages = getTrainerUserImages(currentTrainer);
@@ -70,13 +73,14 @@ const elements = {
   bodyText: document.getElementById("bodyText"),
   imageInput: document.getElementById("imageInput"),
   imagePreview: document.getElementById("imagePreview"),
+  controlPin: document.getElementById("controlPin"),
   transferWilling: document.getElementById("transferWilling"),
   publishButton: document.getElementById("publishButton"),
   shareMyListingButton: document.getElementById("shareMyListingButton"),
   publishMessage: document.getElementById("publishMessage"),
 };
 
-elements.catalogCount.textContent = `${stickers.length.toLocaleString("ko-KR")}개 스티커`;
+elements.catalogCount.textContent = `${catalogItems.length.toLocaleString("ko-KR")}개 스티커`;
 elements.parseButton.addEventListener("click", parseInput);
 elements.clearButton.addEventListener("click", clearImportInput);
 elements.previewContent.addEventListener("click", handlePreviewClick);
@@ -93,6 +97,7 @@ elements.publishButton.addEventListener("click", publishListing);
 elements.shareMyListingButton.addEventListener("click", shareMyListing);
 elements.imageInput.addEventListener("change", handleImageInput);
 elements.imagePreview.addEventListener("click", handleImagePreviewClick);
+elements.controlPin.addEventListener("input", handleControlPinInput);
 
 applyTrainerInfo(currentTrainer);
 renderPreview(currentImport);
@@ -273,8 +278,13 @@ function renderSearchResults() {
     return;
   }
 
-  const results = stickers
-    .filter((sticker) => sticker.normalizedKey.includes(query) || normalizeStickerKey(sticker.key).includes(query))
+  const results = catalogItems
+    .filter((sticker) =>
+      sticker.normalizedKey.includes(query)
+      || normalizeStickerKey(sticker.key).includes(query)
+      || normalizeStickerKey(sticker.id).includes(query)
+      || normalizeStickerKey(sticker.catalogId).includes(query)
+    )
     .sort(compareStickersByKoreanName)
     .slice(0, 36);
 
@@ -290,7 +300,7 @@ function renderSearchResults() {
     const button = document.createElement("button");
     button.type = "button";
     button.className = "result-button";
-    button.dataset.normalizedKey = sticker.normalizedKey;
+    button.dataset.stickerId = sticker.id;
 
     const thumbnail = document.createElement("img");
     thumbnail.src = getStickerImageUrl(sticker);
@@ -307,10 +317,10 @@ function renderSearchResults() {
 }
 
 async function handleSearchResultClick(event) {
-  const button = event.target.closest("[data-normalized-key]");
+  const button = event.target.closest("[data-sticker-id]");
   if (!button) return;
 
-  const sticker = catalogIndex.byNormalizedKey.get(button.dataset.normalizedKey);
+  const sticker = catalogIndex.byId.get(button.dataset.stickerId);
   if (!sticker) return;
 
   const group = findGroup(elements.targetGroup.value);
@@ -508,6 +518,11 @@ function handleImagePreviewClick(event) {
   markLocalChange(elements.publishMessage, `${removedImage?.name || "추가 이미지"}를 첨부 목록에서 제거했습니다.`);
 }
 
+function handleControlPinInput() {
+  elements.controlPin.value = elements.controlPin.value.replace(/\D+/g, "").slice(0, 4);
+  updatePublishAvailability();
+}
+
 function preventFormSubmit(event) {
   event.preventDefault();
 }
@@ -540,7 +555,13 @@ function updatePublishAvailability() {
     contact: "placeholder",
   });
   const listingId = getPersonalListingShareId();
-  elements.publishButton.disabled = !validation.ok;
+  const existingListing = getExistingPersonalListing();
+  const pin = getControlPinValue();
+  const hasKnownControlPin = Boolean(existingListing?.hasControlPin || currentTrainer.hasControlPin);
+  const needsPin = listingStoreMode === "firebase" && !hasKnownControlPin;
+  const pinIsUsable = listingStoreMode !== "firebase"
+    || (pin ? isValidControlPin(pin) : !needsPin);
+  elements.publishButton.disabled = !validation.ok || !pinIsUsable;
   elements.shareMyListingButton.disabled = listingStoreMode !== "firebase" || !listingId;
   elements.publishButton.textContent = getExistingPersonalListing() ? "교환 글 게시" : "교환 글 게시";
 }
@@ -571,7 +592,8 @@ async function saveOrUpdatePersonalListing(messageElement, successMessage = "") 
     listingsCache = result.listings;
     currentUserImages = getListingUserImages(result.listing);
     renderImagePreview();
-    saveTrainerFromForm(result.listing.id);
+    elements.controlPin.value = "";
+    saveTrainerFromForm(result.listing.id, result.listing.hasControlPin);
     updatePublishAvailability();
 
     setMessage(
@@ -625,16 +647,17 @@ async function copyTextToClipboard(text) {
 function applyTrainerInfo(trainer) {
   elements.nickname.value = trainer.nickname ?? "";
   elements.contact.value = trainer.contact ?? "";
-  elements.bodyText.value = trainer.body ?? "";
+  elements.bodyText.value = normalizeListingBodyInput(trainer.body);
   elements.transferWilling.checked = Boolean(trainer.transferWilling);
 }
 
-function saveTrainerFromForm(listingId = currentTrainer.listingId) {
+function saveTrainerFromForm(listingId = currentTrainer.listingId, hasControlPin = currentTrainer.hasControlPin) {
   currentTrainer = {
     listingId,
+    hasControlPin: Boolean(hasControlPin),
     nickname: elements.nickname.value,
     contact: elements.contact.value,
-    body: elements.bodyText.value,
+    body: normalizeListingBodyInput(elements.bodyText.value),
     transferWilling: elements.transferWilling.checked,
     images: currentUserImages,
   };
@@ -686,6 +709,7 @@ function loadTrainerInfo() {
   try {
     return {
       listingId: "",
+      hasControlPin: false,
       nickname: "",
       contact: "",
       body: "",
@@ -696,6 +720,7 @@ function loadTrainerInfo() {
   } catch {
     return {
       listingId: "",
+      hasControlPin: false,
       nickname: "",
       contact: "",
       body: "",
@@ -722,9 +747,11 @@ function getTrainerUserImages(trainer) {
 function getListingUserImages(listing) {
   const images = Array.isArray(listing?.images)
     ? listing.images
-    : listing?.image
-      ? [listing.image]
-      : [];
+    : listing?.firstImage
+      ? [listing.firstImage]
+      : listing?.image
+        ? [listing.image]
+        : [];
 
   return reindexUserImages(images.filter((image) => image && !image.generated));
 }
@@ -740,21 +767,64 @@ function reindexUserImages(images) {
 async function getPublishFormData() {
   const formData = getFormData();
   const tradeSheetImages = await getReusableProfileSheetImages(currentImport);
-  formData.images = [...tradeSheetImages, ...currentUserImages];
+  const userImages = getUserImagesForPublish();
+  currentUserImages = userImages;
+  saveTrainerFromForm();
+  formData.images = [...tradeSheetImages, ...userImages];
   formData.image = formData.images[0];
 
   return formData;
+}
+
+function getUserImagesForPublish() {
+  return mergeUserImageLists(currentUserImages, getTrainerUserImages(loadTrainerInfo()));
+}
+
+function mergeUserImageLists(...imageLists) {
+  const seen = new Set();
+  const merged = [];
+
+  for (const image of imageLists.flat()) {
+    if (!image || image.generated) continue;
+    const key = getUserImageIdentity(image);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(image);
+  }
+
+  return reindexUserImages(merged);
+}
+
+function getUserImageIdentity(image) {
+  return [
+    image.storagePath || "",
+    image.url || "",
+    image.dataUrl || "",
+    image.name || image.originalName || "",
+    image.size || image.originalSize || "",
+    image.width || "",
+    image.height || "",
+  ].join("|");
 }
 
 function getFormData() {
   return {
     nickname: elements.nickname.value,
     contact: elements.contact.value,
-    body: elements.bodyText.value,
+    body: normalizeListingBodyInput(elements.bodyText.value),
     images: currentUserImages,
     image: currentUserImages[0] ?? null,
+    controlPin: getControlPinValue(),
     transferWilling: elements.transferWilling.checked,
   };
+}
+
+function normalizeListingBodyInput(value) {
+  return String(value ?? "").trim().slice(0, LISTING_BODY_MAX_LENGTH);
+}
+
+function getControlPinValue() {
+  return String(elements.controlPin?.value ?? "").trim();
 }
 
 function clearGeneratedImage() {

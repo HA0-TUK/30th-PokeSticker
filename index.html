@@ -60,13 +60,17 @@
             <div class="post-fields">
               <label class="field">
                 <span>교환 글 본문</span>
-                <textarea id="bodyText" rows="4" maxlength="1000" placeholder="교환 희망 지역, 우선순위, 참고 사항 등을 적어주세요."></textarea>
+                <textarea id="bodyText" rows="4" maxlength="500" placeholder="교환 희망 지역, 우선순위, 참고 사항 등을 적어주세요."></textarea>
               </label>
               <label class="field">
                 <span>추가 이미지 첨부 (최대 5장, 원본 각 5MB)</span>
                 <input id="imageInput" type="file" accept="image/*" multiple />
               </label>
               <div id="imagePreview" class="image-preview hidden"></div>
+              <label class="field pin-field">
+                <span>게시글 관리 PIN</span>
+                <input id="controlPin" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="4" pattern="[0-9]{4}" placeholder="숫자 4자리" />
+              </label>
               <div class="publish-actions">
                 <button id="publishButton" type="button" disabled>게시</button>
                 <button id="shareMyListingButton" type="button" class="secondary" disabled>내 교환 글 공유</button>

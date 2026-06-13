@@ -709,11 +709,17 @@ button.secondary:hover {
   flex-wrap: wrap;
 }
 
-.listing-share-button {
+.listing-share-button,
+.listing-control-button {
   min-width: 64px;
   min-height: 32px;
   padding: 0 10px;
   font-size: 12px;
+}
+
+.listing-control-button.danger {
+  border-color: rgba(251, 113, 133, 0.55);
+  color: #fecdd3;
 }
 
 .listing-card h3 {
@@ -1150,6 +1156,36 @@ button.secondary:hover {
   font-weight: 900;
   text-align: center;
   transform: translateX(-50%);
+}
+
+.control-pin-dialog {
+  position: fixed;
+  inset: 0;
+  z-index: 1010;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: rgba(0, 0, 0, 0.72);
+}
+
+.control-pin-box {
+  width: min(360px, 100%);
+  box-sizing: border-box;
+  padding: 18px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: #111827;
+  box-shadow: 0 24px 72px rgba(0, 0, 0, 0.46);
+}
+
+.control-pin-box h2 {
+  margin: 0 0 14px;
+  color: var(--yellow);
+  font-size: 18px;
+}
+
+.control-pin-box .actions {
+  margin-top: 14px;
 }
 
 .hidden {
