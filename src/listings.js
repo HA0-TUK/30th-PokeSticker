@@ -319,7 +319,7 @@ function setPaginationBusy(isBusy) {
 async function editControlledListing(listingId, knownListing = null) {
   try {
     const { listing } = await requestListingControl(listingId, knownListing);
-    if (!window.confirm("마이페이지의 내용을 해당 게시글로 덮어쓰겠습니다.")) return;
+    if (!window.confirm("게시글 수정을 위해 마이페이지로 이동합니다. 게시되지 않은 내용은 저장되지 않습니다.")) return;
 
     const listingWithDetails = await loadListingWithDetails(listing);
     overwriteMypageFromListing(listingWithDetails || listing);
