@@ -827,6 +827,7 @@ button.secondary:hover {
   position: relative;
   display: block;
   width: 100%;
+  aspect-ratio: 11 / 7;
   min-height: 0;
   padding: 0;
   border: 0;
@@ -842,19 +843,23 @@ button.secondary:hover {
 .listing-image {
   display: block;
   width: 100%;
-  height: auto;
+  height: 100%;
   background: #0b1120;
+  object-fit: contain;
 }
 
 .listing-fallback-preview {
   display: none;
+  box-sizing: border-box;
   width: 100%;
+  height: 100%;
   padding: 24px;
   color: var(--ink);
   font-size: 12px;
   font-weight: 800;
   line-height: 1.5;
   text-align: left;
+  overflow: hidden;
 }
 
 .listing-fallback-preview > strong {
@@ -874,10 +879,13 @@ button.secondary:hover {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .fallback-preview-column {
   min-width: 0;
+  min-height: 0;
   padding: 10px;
   border: 1px dashed rgba(255, 255, 255, 0.18);
   border-radius: 8px;
@@ -907,6 +915,7 @@ button.secondary:hover {
   margin: 0;
   padding: 0;
   list-style: none;
+  overflow: hidden;
 }
 
 .fallback-preview-column li,

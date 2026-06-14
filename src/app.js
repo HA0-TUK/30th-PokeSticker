@@ -31,10 +31,11 @@ const MAX_USER_IMAGES = 5;
 const REFERENCE_ASSET_ORIGIN = "public";
 const SHEET_WIDTH = 2200;
 const SHEET_HEIGHT = 1400;
-const SHEET_LAYOUT_VERSION = "compact-left-no-label-v12-hide-empty-groups";
-const SHEET_MAX_ITEMS_PER_ROW = 10;
-const SHEET_MAX_ITEMS_PER_COLUMN = 10;
-const SHEET_MIN_ITEM_CELL_HEIGHT = 104;
+const SHEET_LAYOUT_VERSION = "compact-left-no-label-v15-roomier-icon-cells";
+const SHEET_MAX_ITEMS_PER_ROW = 7;
+const SHEET_MAX_ITEM_CELL_WIDTH = 156;
+const SHEET_MAX_ITEM_CELL_HEIGHT = 172;
+const SHEET_MIN_ITEM_CELL_HEIGHT = 132;
 const koreanNameCollator = new Intl.Collator("ko-KR", {
   sensitivity: "base",
   numeric: false,
@@ -1396,7 +1397,7 @@ async function drawReferenceItemCard(context, item, x, y, width, height, useImag
   const imageBoxX = x + paddingX;
   const imageBoxY = y + paddingTop;
 
-  drawRoundedRect(context, x, y, width, height, radius, "rgba(17, 24, 39, 0.72)", "rgba(255, 255, 255, 0.12)", 1);
+  drawRoundedRect(context, x, y, width, height, radius, "rgba(255, 255, 255, 0.16)", "rgba(255, 255, 255, 0.28)", 1);
 
   const imageUrl = getStickerImageUrl(item);
   const image = useImages && imageUrl ? await loadCanvasImage(imageUrl) : null;
@@ -1417,20 +1418,23 @@ async function drawReferenceItemCard(context, item, x, y, width, height, useImag
 function getReferenceGridLayout(count, width, height) {
   const density = getReferenceGridDensity(count);
   const { gap, maxWidth, maxHeight, minWidth, minHeight } = density;
-  const minCellHeight = getReferenceGridMinCellHeight(height, gap, minHeight);
-  const maxCellHeight = Math.max(maxHeight, minCellHeight);
   const maxColumns = Math.min(count, SHEET_MAX_ITEMS_PER_ROW, Math.max(1, Math.floor((width + gap) / (minWidth + gap))));
+  const referenceCellWidth = getReferenceCellWidth(width, gap, maxColumns);
+  const minCellHeight = getReferenceGridMinCellHeight(minHeight, referenceCellWidth);
+  const maxCellWidth = Math.max(maxWidth, Math.min(SHEET_MAX_ITEM_CELL_WIDTH, referenceCellWidth || maxWidth));
+  const maxCellHeight = Math.max(maxHeight, minCellHeight, Math.min(SHEET_MAX_ITEM_CELL_HEIGHT, referenceCellWidth * 1.12 || maxHeight));
+  const maxRows = getReferenceGridMaxRows(height, gap, minCellHeight);
   let bestFit = null;
 
   for (let columns = maxColumns; columns >= 1; columns -= 1) {
     const rows = Math.ceil(count / columns);
-    if (rows > SHEET_MAX_ITEMS_PER_COLUMN) continue;
+    if (rows > maxRows) continue;
 
     const rawCellWidth = (width - gap * (columns - 1)) / columns;
     const rawCellHeight = (height - gap * (rows - 1)) / rows;
     if (rawCellWidth < minWidth || rawCellHeight < minCellHeight) continue;
 
-    const cellWidth = Math.min(maxWidth, rawCellWidth);
+    const cellWidth = Math.min(maxCellWidth, rawCellWidth);
     const cellHeight = Math.min(maxCellHeight, rawCellHeight);
     const emptyCells = columns * rows - count;
     const score = columns * 100000 - rows * 1000 - emptyCells * 100 + cellWidth * cellHeight;
@@ -1459,16 +1463,13 @@ function getReferenceGridLayout(count, width, height) {
 
   let bestOverflow = null;
   for (let columns = maxColumns; columns >= 1; columns -= 1) {
-    const rows = Math.min(
-      SHEET_MAX_ITEMS_PER_COLUMN,
-      Math.max(1, Math.floor((height + gap) / (minCellHeight + gap))),
-    );
+    const rows = maxRows;
     const rawCellWidth = (width - gap * (columns - 1)) / columns;
     const rawCellHeight = (height - gap * (rows - 1)) / rows;
     if (rawCellWidth < minWidth || rawCellHeight < minCellHeight) continue;
 
     const visibleCount = columns * rows;
-    const cellWidth = Math.min(maxWidth, rawCellWidth);
+    const cellWidth = Math.min(maxCellWidth, rawCellWidth);
     const cellHeight = Math.min(maxCellHeight, rawCellHeight);
     const score = visibleCount * 100000 + columns * 1000 + Math.min(cellHeight, maxHeight);
     if (!bestOverflow || score > bestOverflow.score) {
@@ -1493,9 +1494,20 @@ function getReferenceGridLayout(count, width, height) {
   };
 }
 
-function getReferenceGridMinCellHeight(height, gap, fallbackMinHeight) {
-  const tenRowsHeight = (height - gap * (SHEET_MAX_ITEMS_PER_COLUMN - 1)) / SHEET_MAX_ITEMS_PER_COLUMN;
-  return Math.max(SHEET_MIN_ITEM_CELL_HEIGHT, fallbackMinHeight, tenRowsHeight);
+function getReferenceGridMinCellHeight(fallbackMinHeight, referenceCellWidth) {
+  const widthBasedHeight = referenceCellWidth
+    ? Math.min(SHEET_MAX_ITEM_CELL_HEIGHT, referenceCellWidth * 1.02)
+    : 0;
+  return Math.max(SHEET_MIN_ITEM_CELL_HEIGHT, fallbackMinHeight, widthBasedHeight);
+}
+
+function getReferenceGridMaxRows(height, gap, minCellHeight) {
+  return Math.max(1, Math.floor((height + gap) / (minCellHeight + gap)));
+}
+
+function getReferenceCellWidth(width, gap, columns) {
+  if (!columns || columns <= 0) return 0;
+  return (width - gap * (columns - 1)) / columns;
 }
 
 function getReferenceGridCapacity(count, width, height) {
