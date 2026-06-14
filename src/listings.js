@@ -6,6 +6,15 @@ import {
   sortListingsForProfile,
 } from "./importer.js";
 import {
+  SHEET_LAYOUT_VERSION,
+  createProfileSheetImageDescriptors,
+  renderProfileSheetImageBlob,
+} from "./profile-sheet.js";
+import {
+  loadGeneratedSheetBlob,
+  saveGeneratedSheetBlob,
+} from "./generated-sheet-cache.js";
+import {
   DEFAULT_LISTINGS_PAGE_SIZE,
   deleteControlledListing,
   deletePersonalListing,
@@ -57,6 +66,7 @@ let listingsBroadcastChannel = null;
 let sharedListingId = getSharedListingId();
 let highlightedListingId = sharedListingId;
 let renderedListingsById = new Map();
+let renderedListingsSignature = "";
 let paginationState = {
   pageIndex: 0,
   totalPages: 1,
@@ -66,6 +76,12 @@ let paginationState = {
 };
 const carouselStates = new WeakMap();
 const preloadedImageSources = new Set();
+const generatedSheetObjectUrls = new Set();
+const generatedSheetMemorySources = new Map();
+const generatedSheetJobs = [];
+const generatedSheetJobKeys = new Set();
+const GENERATED_SHEET_RENDER_CONCURRENCY = 1;
+let activeGeneratedSheetJobs = 0;
 
 resetListingsButton.addEventListener("click", async () => {
   const message =
@@ -127,7 +143,14 @@ async function initializeListingsPage() {
       : "게시판에 접근할 수 없습니다.";
 
   if (listingStoreMode === "firebase") {
-    renderListingCards(sortListingsForProfile(loadCachedListings().slice(0, DEFAULT_LISTINGS_PAGE_SIZE), loadProfile()), { loading: true });
+    const cachedListings = sortListingsForProfile(loadCachedListings().slice(0, DEFAULT_LISTINGS_PAGE_SIZE), loadProfile());
+    if (!sharedListingId && cachedListings.length > 0) {
+      await prepareGeneratedSheetSourcesForRender(cachedListings);
+      renderListingCards(cachedListings, {
+        loading: true,
+        preserveGeneratedSheetObjectUrls: true,
+      });
+    }
   }
 
   const shareTarget = sharedListingId
@@ -152,7 +175,14 @@ async function renderListings(pageIndex = paginationState.pageIndex || 0, option
     pageSize: DEFAULT_LISTINGS_PAGE_SIZE,
   });
   const listings = sortListingsForProfile(result.listings, currentProfile);
-  renderListingCards(listings);
+  if (canReuseRenderedListingCards(listings, options)) {
+    rememberRenderedListings(listings);
+  } else {
+    await prepareGeneratedSheetSourcesForRender(listings);
+    renderListingCards(listings, {
+      preserveGeneratedSheetObjectUrls: true,
+    });
+  }
   renderPagination(result);
 
   if (options.focusListingId) {
@@ -220,8 +250,9 @@ function setupListingsAutoRefresh() {
 }
 
 function renderListingCards(listings, options = {}) {
+  if (!options.preserveGeneratedSheetObjectUrls) revokeGeneratedSheetObjectUrls();
   listingList.innerHTML = "";
-  renderedListingsById = new Map((listings || []).map((listing) => [listing.id, listing]));
+  rememberRenderedListings(listings || []);
 
   if (listings.length === 0) {
     const empty = document.createElement("div");
@@ -236,6 +267,69 @@ function renderListingCards(listings, options = {}) {
   for (const listing of listings) {
     listingList.append(createListingCard(listing));
   }
+}
+
+function rememberRenderedListings(listings) {
+  renderedListingsById = new Map((listings || []).map((listing) => [listing.id, listing]));
+  renderedListingsSignature = createListingsRenderSignature(listings || []);
+}
+
+function canReuseRenderedListingCards(listings, options = {}) {
+  if (options.forceRender || options.loading || !Array.isArray(listings) || listings.length === 0) return false;
+  if (!renderedListingsSignature || listingList.children.length === 0) return false;
+  return renderedListingsSignature === createListingsRenderSignature(listings);
+}
+
+function createListingsRenderSignature(listings = []) {
+  return JSON.stringify({
+    profile: {
+      wanted: createGroupsRenderSignature(currentProfile?.wantedGroups),
+      owned: createGroupsRenderSignature(currentProfile?.ownedGroups),
+    },
+    listings: (listings || []).map((listing) => ({
+      id: listing?.id || "",
+      ownerUid: listing?.ownerUid || "",
+      nickname: listing?.nickname || "",
+      contact: listing?.contact || "",
+      body: listing?.body || "",
+      transferWilling: Boolean(listing?.transferWilling),
+      createdAt: listing?.createdAt || "",
+      updatedAt: listing?.updatedAt || "",
+      imageCount: Number(listing?.imageCount || 0),
+      attachmentImageCount: Number(listing?.attachmentImageCount || 0),
+      sheetPageCount: Number(listing?.sheetPageCount || 0),
+      sheetProfileSignature: listing?.sheetProfileSignature || "",
+      sheetLayoutVersion: listing?.sheetLayoutVersion || "",
+      catalogSchemaVersion: listing?.catalogSchemaVersion || "",
+      wanted: createGroupsRenderSignature(listing?.wantedGroups),
+      owned: createGroupsRenderSignature(listing?.ownedGroups),
+      firstImage: createImageRenderSignature(listing?.firstImage || listing?.image),
+      attachments: getListingAttachmentImages(listing).map(createImageRenderSignature),
+    })),
+  });
+}
+
+function createGroupsRenderSignature(groups = []) {
+  return (groups || []).map((group) => ({
+    id: group?.id || "",
+    label: group?.label || "",
+    subtitle: group?.subtitle || "",
+    items: (group?.items || []).map((item) => getItemKey(item) || item?.key || item?.rawKey || item?.name || ""),
+  }));
+}
+
+function createImageRenderSignature(image) {
+  if (!image) return null;
+  return {
+    url: image.url || "",
+    storagePath: image.storagePath || "",
+    name: image.name || image.originalName || "",
+    size: Number(image.size || image.originalSize || 0),
+    width: Number(image.width || 0),
+    height: Number(image.height || 0),
+    generated: Boolean(image.generated),
+    order: Number(image.order || 0),
+  };
 }
 
 function renderPagination(result = {}) {
@@ -618,7 +712,7 @@ function createListingGallery(images, listing) {
   const nextButton = createCarouselControl("›", "다음 이미지 보기", "next");
   const counter = document.createElement("span");
   counter.className = "carousel-count";
-  const displayImageCount = Math.max(images.length, Number(listing?.imageCount || 0));
+  const displayImageCount = getExpectedCarouselImageCount(listing, images);
 
   const dotButtons = Array.from({ length: displayImageCount }, (_, index) => {
     const dotButton = document.createElement("button");
@@ -718,7 +812,9 @@ async function handleListingListClick(event) {
       return;
     }
     ensureCarouselLoaded(carousel);
+    await ensureGeneratedSheetSource(carousel, state.images[state.activeIndex]);
     const modalImageList = await loadCarouselModalImages(carousel);
+    await ensureGeneratedSheetSource(carousel, modalImageList[state.activeIndex]);
     if (!getListingImageSource(modalImageList[state.activeIndex])) return;
     showImageModal(modalImageList, state.activeIndex);
     return;
@@ -747,7 +843,7 @@ function handleCarouselPointerUp(event) {
   const viewport = event.target.closest(".listing-carousel-viewport");
   const carousel = viewport?.closest(".listing-carousel");
   const state = carousel ? carouselStates.get(carousel) : null;
-  const displayImageCount = Math.max(state?.images?.length || 0, Number(state?.listing?.imageCount || 0));
+  const displayImageCount = getExpectedCarouselImageCount(state?.listing, state?.images || []);
   if (!state || displayImageCount <= 1) return;
 
   const deltaX = event.clientX - state.startX;
@@ -805,6 +901,12 @@ function setCarouselImage(carousel, nextIndex) {
   const source = getListingImageSource(listingImage);
   if (source) {
     if (state.image.getAttribute("src") !== source) state.image.src = source;
+  } else if (isLocalGeneratedSheetImage(listingImage)) {
+    state.image.removeAttribute("src");
+    renderFallbackPreview(state.fallbackPreview, state.listing, listingImage, {
+      missing: false,
+    });
+    queueGeneratedSheetRender(carousel, listingImage);
   } else {
     state.image.removeAttribute("src");
     renderFallbackPreview(state.fallbackPreview, state.listing, listingImage, {
@@ -814,7 +916,7 @@ function setCarouselImage(carousel, nextIndex) {
   state.frameButton.classList.toggle("missing-preview", !source);
   state.image.alt = listingImage.name || "첨부 이미지";
   state.frameButton.setAttribute("aria-label", `${state.activeIndex + 1}번째 첨부 이미지 크게 보기`);
-  state.counter.textContent = `${state.activeIndex + 1} / ${Math.max(state.images.length, Number(state.listing?.imageCount || 0))}`;
+  state.counter.textContent = `${state.activeIndex + 1} / ${getExpectedCarouselImageCount(state.listing, state.images)}`;
   state.loaded = true;
   state.dotButtons.forEach((dotButton, index) => {
     dotButton.classList.toggle("active", index === state.activeIndex);
@@ -869,19 +971,97 @@ function ensureCarouselLoaded(carousel) {
   setCarouselImage(carousel, state.activeIndex);
 }
 
+async function ensureGeneratedSheetSource(carousel, image) {
+  if (!isLocalGeneratedSheetImage(image) || getListingImageSource(image)) return getListingImageSource(image);
+  const state = carouselStates.get(carousel);
+  if (!state) return "";
+
+  try {
+    const source = await getOrCreateGeneratedSheetSource(state.listing, image);
+    if (!source) return "";
+    if (state.images[state.activeIndex] === image) {
+      setCarouselImage(carousel, state.activeIndex);
+    }
+    return source;
+  } catch (error) {
+    image.loadFailed = true;
+    console.warn("援먰솚 紐⑸줉 ?대?吏瑜??앹꽦?섏? 紐삵뻽?듬땲??", error);
+    return "";
+  }
+}
+
+function queueGeneratedSheetRender(carousel, image) {
+  if (!isLocalGeneratedSheetImage(image) || getListingImageSource(image) || image.loadFailed) return;
+  const cacheKey = image.cacheKey || "";
+  if (!cacheKey || generatedSheetJobKeys.has(cacheKey)) return;
+
+  generatedSheetJobKeys.add(cacheKey);
+  generatedSheetJobs.push({ carousel, image });
+  pumpGeneratedSheetQueue();
+}
+
+function pumpGeneratedSheetQueue() {
+  while (activeGeneratedSheetJobs < GENERATED_SHEET_RENDER_CONCURRENCY && generatedSheetJobs.length > 0) {
+    const job = generatedSheetJobs.shift();
+    activeGeneratedSheetJobs += 1;
+    processGeneratedSheetJob(job)
+      .catch((error) => console.warn("援먰솚 紐⑸줉 ?대?吏 ?먮룞 ?앹꽦???ㅽ뙣?덉뒿?덈떎.", error))
+      .finally(() => {
+        activeGeneratedSheetJobs -= 1;
+        generatedSheetJobKeys.delete(job.image.cacheKey || "");
+        pumpGeneratedSheetQueue();
+      });
+  }
+}
+
+async function processGeneratedSheetJob(job) {
+  const { carousel, image } = job;
+  const state = carouselStates.get(carousel);
+  if (!state || !state.images.includes(image)) return;
+
+  await ensureGeneratedSheetSource(carousel, image);
+}
+
+async function getOrCreateGeneratedSheetSource(listing, image) {
+  if (!isLocalGeneratedSheetImage(image)) return "";
+  if (image.objectUrl) return image.objectUrl;
+
+  const cachedBlob = await loadGeneratedSheetBlob(image.cacheKey);
+  const blob = cachedBlob || (await renderProfileSheetImageBlob(listing, {
+    pageIndex: image.sheetPageIndex || 0,
+  })).blob;
+
+  if (!cachedBlob) {
+    await saveGeneratedSheetBlob(image.cacheKey, blob, {
+      width: image.width,
+      height: image.height,
+      type: image.type,
+    });
+  }
+
+  const objectUrl = rememberGeneratedSheetObjectUrl(image.cacheKey, blob);
+  image.objectUrl = objectUrl;
+  image.url = objectUrl;
+  image.loadFailed = false;
+  return objectUrl;
+}
+
 async function loadCarouselModalImages(carousel) {
   const state = carouselStates.get(carousel);
   if (!state) return [];
-  if (state.detailLoaded) return state.images;
+  if (state.detailLoaded) {
+    await ensureAllGeneratedSheetSources(carousel);
+    return state.images;
+  }
 
-  const expectedImageCount = Number(state.listing?.imageCount || state.images.length || 0);
+  const expectedImageCount = getExpectedCarouselImageCount(state.listing, state.images);
   if (!shouldTryLoadListingDetails(state, expectedImageCount)) {
     state.detailLoaded = true;
     return state.images;
   }
 
   state.detailLoading ??= loadListingWithDetails(state.listing)
-    .then((listingWithDetails) => {
+    .then(async (listingWithDetails) => {
       const images = normalizeListingImages(listingWithDetails);
       if (listingWithDetails && images.length > 0) {
         state.listing = listingWithDetails;
@@ -889,6 +1069,7 @@ async function loadCarouselModalImages(carousel) {
         renderedListingsById.set(listingWithDetails.id, listingWithDetails);
       }
       state.detailLoaded = true;
+      await ensureAllGeneratedSheetSources(carousel);
       return state.images;
     })
     .catch((error) => {
@@ -901,6 +1082,17 @@ async function loadCarouselModalImages(carousel) {
     });
 
   return state.detailLoading;
+}
+
+async function ensureAllGeneratedSheetSources(carousel) {
+  const state = carouselStates.get(carousel);
+  if (!state) return;
+
+  for (const image of state.images) {
+    if (isLocalGeneratedSheetImage(image)) {
+      await ensureGeneratedSheetSource(carousel, image);
+    }
+  }
 }
 
 function shouldTryLoadListingDetails(state, expectedImageCount) {
@@ -977,6 +1169,8 @@ function showModalImageAt(nextIndex) {
 
 function getListingImageSource(image, options = {}) {
   if (!options.includeFailed && image?.loadFailed) return "";
+  if (isLocalGeneratedSheetImage(image)) return image?.objectUrl || image?.url || "";
+  if (image?.generated) return "";
   return image?.url || image?.dataUrl || "";
 }
 
@@ -1042,9 +1236,140 @@ function createFallbackPreviewColumn(label, groups, type) {
 }
 
 function normalizeListingImages(listing) {
-  if (Array.isArray(listing?.images) && listing.images.length > 0) return listing.images;
-  if (listing?.firstImage) return [listing.firstImage];
-  return listing?.image ? [listing.image] : [];
+  if (!listing) return [];
+  return [
+    ...createListingGeneratedSheetImages(listing),
+    ...getListingAttachmentImages(listing),
+  ];
+}
+
+async function prepareGeneratedSheetSourcesForRender(listings) {
+  revokeGeneratedSheetObjectUrls();
+
+  const imageByCacheKey = new Map();
+  for (const listing of listings || []) {
+    for (const image of createListingGeneratedSheetImages(listing)) {
+      if (image.cacheKey && !generatedSheetMemorySources.has(image.cacheKey)) {
+        imageByCacheKey.set(image.cacheKey, image);
+      }
+    }
+  }
+
+  await Promise.all([...imageByCacheKey].map(async ([cacheKey, image]) => {
+    const blob = await loadGeneratedSheetBlob(cacheKey);
+    if (!blob) return;
+    rememberGeneratedSheetObjectUrl(cacheKey, blob, {
+      type: image.type,
+      width: image.width,
+      height: image.height,
+    });
+  }));
+}
+
+function createListingGeneratedSheetImages(listing) {
+  const descriptors = createProfileSheetImageDescriptors(listing);
+  const expectedPageCount = Math.max(
+    descriptors.length,
+    Number.isFinite(Number(listing?.sheetPageCount)) ? Number(listing.sheetPageCount) : 0,
+  );
+
+  return Array.from({ length: Math.max(1, expectedPageCount) }, (_, pageIndex) => {
+    const descriptor = descriptors[pageIndex] || descriptors[0] || {};
+    const sheetPageCount = Math.max(1, expectedPageCount);
+    const profileSignature = descriptor.profileSignature || listing?.sheetProfileSignature || "";
+
+    const cacheKey = createGeneratedSheetCacheKey(listing, pageIndex, profileSignature);
+    const cachedSource = generatedSheetMemorySources.get(cacheKey) || "";
+
+    return {
+      ...descriptor,
+      name: descriptor.name || `poke30-tra-compatible-sheet-${pageIndex + 1}.webp`,
+      generated: true,
+      localGenerated: true,
+      url: cachedSource,
+      objectUrl: cachedSource,
+      profileSignature,
+      sheetLayoutVersion: listing?.sheetLayoutVersion || SHEET_LAYOUT_VERSION,
+      sheetPageIndex: pageIndex,
+      sheetPageCount,
+      cacheKey,
+      order: pageIndex,
+    };
+  });
+}
+
+function getListingAttachmentImages(listing) {
+  const images = Array.isArray(listing?.images) && listing.images.length > 0
+    ? listing.images
+    : listing?.firstImage
+      ? [listing.firstImage]
+      : listing?.image
+        ? [listing.image]
+        : [];
+
+  return images.filter((image) => image && !image.generated);
+}
+
+function getExpectedCarouselImageCount(listing, images = []) {
+  const generatedCount = Math.max(1, Number.isFinite(Number(listing?.sheetPageCount)) ? Number(listing.sheetPageCount) : 0);
+  const attachmentCount = Number.isFinite(Number(listing?.attachmentImageCount))
+    ? Number(listing.attachmentImageCount)
+    : getListingAttachmentImages(listing).length;
+  const declaredCount = Number.isFinite(Number(listing?.imageCount)) ? Number(listing.imageCount) : 0;
+
+  return Math.max(images.length, declaredCount, generatedCount + attachmentCount);
+}
+
+function createGeneratedSheetCacheKey(listing, pageIndex, profileSignature) {
+  return [
+    "auto-sheet",
+    "v1",
+    normalizeCacheKeyPart(listing?.id || listing?.ownerUid || "local"),
+    normalizeCacheKeyPart(listing?.updatedAt || listing?.createdAt || ""),
+    normalizeCacheKeyPart(listing?.sheetLayoutVersion || SHEET_LAYOUT_VERSION),
+    normalizeCacheKeyPart(listing?.catalogSchemaVersion || ""),
+    String(pageIndex),
+    hashString(profileSignature || ""),
+  ].join(":");
+}
+
+function normalizeCacheKeyPart(value) {
+  return String(value ?? "").replace(/[^A-Za-z0-9._-]+/g, "-").slice(0, 120) || "none";
+}
+
+function hashString(value) {
+  let hash = 2166136261;
+  const text = String(value ?? "");
+
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+
+  return (hash >>> 0).toString(36);
+}
+
+function isLocalGeneratedSheetImage(image) {
+  return Boolean(image?.generated && image?.localGenerated);
+}
+
+function rememberGeneratedSheetObjectUrl(cacheKey, blob, metadata = {}) {
+  if (!cacheKey || !blob) return "";
+  const existingSource = generatedSheetMemorySources.get(cacheKey);
+  if (existingSource) return existingSource;
+
+  const objectUrl = URL.createObjectURL(blob);
+  generatedSheetMemorySources.set(cacheKey, objectUrl);
+  generatedSheetObjectUrls.add(objectUrl);
+  return objectUrl;
+}
+
+function revokeGeneratedSheetObjectUrls() {
+  for (const objectUrl of generatedSheetObjectUrls) {
+    URL.revokeObjectURL(objectUrl);
+  }
+  generatedSheetObjectUrls.clear();
+  generatedSheetMemorySources.clear();
 }
 
 function hideImageModal() {

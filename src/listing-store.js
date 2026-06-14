@@ -293,23 +293,23 @@ async function transferListingOwnerToCurrentUser(firebase, listing, nextOwnerUid
 
   const listingRef = firebase.doc(firebase.db, LISTINGS_COLLECTION, listing.id);
   const secretRef = firebase.doc(firebase.db, LISTING_SECRETS_COLLECTION, listing.id);
-  const listingPatch = { ownerUid: nextOwnerUid };
-  const secretPatch = { ownerUid: nextOwnerUid, updatedAt };
-
-  if (firebase.writeBatch) {
-    const batch = firebase.writeBatch(firebase.db);
-    batch.set(listingRef, listingPatch, { merge: true });
-    batch.set(secretRef, secretPatch, { merge: true });
-    await batch.commit();
-  } else {
-    await firebase.setDoc(listingRef, listingPatch, { merge: true });
-    await firebase.setDoc(secretRef, secretPatch, { merge: true });
-  }
-
   const updatedListing = {
     ...listing,
     ownerUid: nextOwnerUid,
   };
+  const listingPatch = compactListingForStorage(updatedListing);
+  const secretPatch = { ownerUid: nextOwnerUid, updatedAt };
+
+  if (firebase.writeBatch) {
+    const batch = firebase.writeBatch(firebase.db);
+    batch.set(listingRef, listingPatch);
+    batch.set(secretRef, secretPatch, { merge: true });
+    await batch.commit();
+  } else {
+    await firebase.setDoc(listingRef, listingPatch);
+    await firebase.setDoc(secretRef, secretPatch, { merge: true });
+  }
+
   rememberFirebaseUid(nextOwnerUid);
   updateLocalListingCache(updatedListing);
   return updatedListing;
@@ -359,7 +359,7 @@ export async function deleteControlledListing(listingId) {
   const now = new Date().toISOString();
 
   if (existing && existing.active !== false) {
-    const storagePaths = collectStoragePaths(existingWithDetails.images);
+    const storagePaths = collectDeletionStoragePaths(existingDetail, existingWithDetails);
     const nextRevision = await writeListingDeletionAndMeta(firebase, listingRef, detailRef, deletionRef, {
       listingId: normalizedListingId,
       ownerUid: existing.ownerUid || normalizedListingId,
@@ -606,9 +606,9 @@ export async function savePersonalListing(draftListing, formData, options = {}) 
   const existingWithDetails = mergeListingDetail(existing, existingDetail);
   const existingIsActive = Boolean(existing && existing.active !== false);
   const now = new Date().toISOString();
-  const uploadImages = collectListingUploadImages(draftListing, formData);
+  const uploadImages = collectListingUploadImages(draftListing, formData).filter(isUserAttachmentImage);
   const images = await prepareRemoteImages(firebase, user.uid, uploadImages);
-  const obsoleteStoragePaths = collectObsoleteStoragePaths(existingWithDetails?.images, images)
+  const obsoleteStoragePaths = collectObsoleteStoragePaths((existingWithDetails?.images || []).filter(isUserAttachmentImage), images)
     .filter((storagePath) => isUserStoragePath(storagePath, user.uid));
   const normalizedDraftListing = normalizeListingCatalogFields(draftListing);
   const ownerUid = existing?.ownerUid || user.uid;
@@ -728,7 +728,7 @@ export async function deletePersonalListing() {
   const now = new Date().toISOString();
 
   if (existing && existing.active !== false) {
-    const storagePaths = collectStoragePaths(existingWithDetails.images);
+    const storagePaths = collectDeletionStoragePaths(existingDetail, existingWithDetails);
     const nextRevision = await writeListingDeletionAndMeta(firebase, listingRef, detailRef, deletionRef, {
       listingId: user.uid,
       ownerUid: user.uid,
@@ -1004,6 +1004,7 @@ async function prepareRemoteImages(firebase, ownerUid, images) {
 
 async function prepareRemoteImage(firebase, ownerUid, image, index = 0, uploadBatchId = "default") {
   if (!image) return null;
+  if (image.generated) return null;
   if (image.url) return createStoredImageMetadata(image, index);
   if (!image.dataUrl) return null;
 
@@ -1035,6 +1036,7 @@ async function prepareRemoteImage(firebase, ownerUid, image, index = 0, uploadBa
 }
 
 function createStoredImageMetadata(image, index = 0) {
+  if (image?.generated) return null;
   return normalizeStoredImageMetadata({
     name: image.name || image.originalName || "attachment",
     type: image.type || image.originalType || "image/png",
@@ -1051,6 +1053,10 @@ function createStoredImageMetadata(image, index = 0) {
     height: Number.isFinite(Number(image.height)) ? Number(image.height) : null,
     order: Number.isFinite(Number(image.order)) ? Number(image.order) : index,
   }, index);
+}
+
+function isUserAttachmentImage(image) {
+  return Boolean(image && !image.generated);
 }
 
 function canvasToBlob(canvas, type, quality) {
@@ -1093,6 +1099,14 @@ function collectObsoleteStoragePaths(existingImages = [], nextImages = []) {
 
 function collectStoragePaths(images = []) {
   return (images || []).flatMap(collectImageStoragePaths);
+}
+
+function collectDeletionStoragePaths(detail, listing) {
+  const paths = Array.isArray(detail?.storagePaths) && detail.storagePaths.length > 0
+    ? detail.storagePaths
+    : collectStoragePaths(listing?.images || []);
+
+  return [...new Set(paths.filter(Boolean).map(String))];
 }
 
 function sumImageSizes(images = []) {

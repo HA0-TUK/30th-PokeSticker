@@ -7,6 +7,11 @@ import {
   compactGroupsForStorage,
   createCatalogIndex,
 } from "./importer.js";
+import {
+  SHEET_LAYOUT_VERSION,
+  createProfileSheetPages,
+  getProfileSheetSignature,
+} from "./profile-sheet.js";
 
 const catalogIndex = createCatalogIndex(stickers);
 
@@ -21,8 +26,9 @@ export function normalizeListingCatalogFields(listing = {}) {
 export function compactListingForStorage(listing = {}) {
   const wantedGroups = compactGroupsForStorage(listing.wantedGroups, catalogIndex, "wanted");
   const ownedGroups = compactGroupsForStorage(listing.ownedGroups, catalogIndex, "owned");
-  const images = normalizeStoredImages(listing.images ?? (listing.image ? [listing.image] : []));
+  const images = normalizeStoredImages(listing.images ?? (listing.image ? [listing.image] : [])).filter(isUserAttachmentImage);
   const firstImage = images[0] ?? null;
+  const sheetMeta = getProfileSheetMeta({ wantedGroups, ownedGroups }, listing);
 
   return stripUndefinedFields({
     id: normalizeListingId(listing.id),
@@ -34,7 +40,11 @@ export function compactListingForStorage(listing = {}) {
     active: listing.active !== false,
     deletedAt: listing.deletedAt || null,
     firstImage,
-    imageCount: images.length,
+    imageCount: sheetMeta.sheetPageCount + images.length,
+    attachmentImageCount: images.length,
+    sheetPageCount: sheetMeta.sheetPageCount,
+    sheetProfileSignature: sheetMeta.profileSignature,
+    sheetLayoutVersion: sheetMeta.layoutVersion,
     catalogSchemaVersion: CATALOG_SCHEMA_VERSION,
     wantedGroups,
     ownedGroups,
@@ -51,7 +61,7 @@ export function compactListingForStorage(listing = {}) {
 }
 
 export function compactListingDetailForStorage(listing = {}) {
-  const images = normalizeStoredImages(listing.images ?? (listing.image ? [listing.image] : []));
+  const images = normalizeStoredImages(listing.images ?? (listing.image ? [listing.image] : [])).filter(isUserAttachmentImage);
 
   return stripUndefinedFields({
     id: normalizeListingId(listing.id),
@@ -70,15 +80,29 @@ export function normalizeRemoteListing(id, data) {
     : firstImage
       ? [firstImage]
       : [];
+  const userImages = images.filter(isUserAttachmentImage);
+  const legacySheetPageCount = firstImage?.generated ? firstImage.sheetPageCount : null;
+  const sheetMeta = getProfileSheetMeta(data, {
+    ...data,
+    sheetPageCount: data?.sheetPageCount ?? legacySheetPageCount,
+  });
+  const attachmentImageCount = normalizeNullableInteger(data?.attachmentImageCount) ?? userImages.length;
+  const imageCount = Number.isFinite(Number(data?.imageCount))
+    ? Number(data.imageCount)
+    : sheetMeta.sheetPageCount + attachmentImageCount;
 
   return normalizeListingCatalogFields({
     ...data,
     id: data?.id || id,
     active: data?.active !== false,
-    images,
-    image: images[0] ?? null,
-    firstImage: images[0] ?? null,
-    imageCount: Number.isFinite(Number(data?.imageCount)) ? Number(data.imageCount) : images.length,
+    images: userImages,
+    image: userImages[0] ?? null,
+    firstImage: userImages[0] ?? null,
+    imageCount,
+    attachmentImageCount,
+    sheetPageCount: sheetMeta.sheetPageCount,
+    sheetProfileSignature: sheetMeta.profileSignature,
+    sheetLayoutVersion: sheetMeta.layoutVersion,
     body: normalizeListingBody(data?.body),
     hasControlPin: data?.hasControlPin === true,
     controlSalt: data?.controlSalt ? String(data.controlSalt) : "",
@@ -90,7 +114,7 @@ export function normalizeRemoteListing(id, data) {
 }
 
 export function normalizeRemoteListingDetail(id, data) {
-  const images = normalizeStoredImages(Array.isArray(data?.images) ? data.images : []);
+  const images = normalizeStoredImages(Array.isArray(data?.images) ? data.images : []).filter(isUserAttachmentImage);
 
   return {
     id: data?.id || id,
@@ -107,13 +131,22 @@ export function normalizeRemoteListingDetail(id, data) {
 export function mergeListingDetail(listing, detail) {
   if (!listing) return null;
   if (!detail || !Array.isArray(detail.images) || detail.images.length === 0) return normalizeListingCatalogFields(listing);
+  const images = detail.images.filter(isUserAttachmentImage);
+  const sheetMeta = getProfileSheetMeta(listing, listing);
 
   return normalizeListingCatalogFields({
     ...listing,
-    images: detail.images,
-    image: detail.images[0] ?? listing.image ?? null,
-    firstImage: detail.images[0] ?? listing.firstImage ?? null,
-    imageCount: Number.isFinite(Number(detail.imageCount)) ? Number(detail.imageCount) : detail.images.length,
+    images,
+    image: images[0] ?? listing.image ?? null,
+    firstImage: images[0] ?? listing.firstImage ?? null,
+    attachmentImageCount: images.length,
+    sheetPageCount: sheetMeta.sheetPageCount,
+    sheetProfileSignature: sheetMeta.profileSignature,
+    sheetLayoutVersion: sheetMeta.layoutVersion,
+    imageCount: Math.max(
+      Number.isFinite(Number(listing.imageCount)) ? Number(listing.imageCount) : 0,
+      sheetMeta.sheetPageCount + images.length,
+    ),
   });
 }
 
@@ -142,6 +175,36 @@ export function normalizeStoredImageMetadata(image, index = 0) {
     height: normalizeNullableInteger(image.height),
     order: normalizeNullableInteger(image.order) ?? index,
   });
+}
+
+function getProfileSheetMeta(profile = {}, fallback = {}) {
+  const sheetPageCount = normalizeNullableInteger(fallback?.sheetPageCount)
+    ?? createProfileSheetPages(profile).length;
+  const profileSignature = fallback?.sheetProfileSignature
+    ? normalizeLimitedString(fallback.sheetProfileSignature, 256)
+    : hashString(getProfileSheetSignature(profile));
+
+  return {
+    sheetPageCount: Math.max(1, sheetPageCount),
+    profileSignature,
+    layoutVersion: normalizeLimitedString(fallback?.sheetLayoutVersion || SHEET_LAYOUT_VERSION, 120),
+  };
+}
+
+function isUserAttachmentImage(image) {
+  return Boolean(image && !image.generated);
+}
+
+function hashString(value) {
+  let hash = 2166136261;
+  const text = String(value ?? "");
+
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+
+  return (hash >>> 0).toString(36);
 }
 
 export function collectGroupKeys(groups) {

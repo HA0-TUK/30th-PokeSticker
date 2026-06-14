@@ -60,7 +60,13 @@
             <div class="post-fields">
               <label class="field">
                 <span>교환 글 본문</span>
-                <textarea id="bodyText" rows="4" maxlength="500" placeholder="교환 희망 지역, 우선순위, 참고 사항 등을 적어주세요. (500자)"></textarea>
+                <div class="body-text-editor">
+                  <div id="bodyLimitHighlight" class="body-limit-highlight" aria-hidden="true"></div>
+                  <textarea id="bodyText" rows="4" maxlength="500" placeholder="교환 희망 지역, 우선순위, 참고 사항 등을 적어주세요. (500자)"></textarea>
+                </div>
+                <div class="body-limit-row">
+                  <span id="bodyLimitCounter" class="body-limit-counter">0 / 500</span>
+                </div>
               </label>
               <label class="field">
                 <span>추가 이미지 첨부 (최대 5장, 원본 각 5MB)</span>
@@ -160,6 +166,6 @@
       </form>
     </main>
 
-    <script type="module" src="./src/app.js?v=share-split-20260607-1"></script>
+    <script type="module" src="./src/app.js?v=generated-cache-20260614-1"></script>
   </body>
 </html>

@@ -24,6 +24,7 @@ import {
 const PROFILE_KEY = "pokemon-market-profile";
 const TRAINER_KEY = "pokemon-market-trainer";
 const MAX_SOURCE_IMAGE_BYTES = 5 * 1024 * 1024;
+const BODY_TEXT_INPUT_MAX_LENGTH = 1000;
 const STORED_IMAGE_TYPE = "image/webp";
 const STORED_IMAGE_QUALITY = 0.82;
 const MAX_USER_IMAGES = 5;
@@ -71,6 +72,8 @@ const elements = {
   nickname: document.getElementById("nickname"),
   contact: document.getElementById("contact"),
   bodyText: document.getElementById("bodyText"),
+  bodyLimitCounter: document.getElementById("bodyLimitCounter"),
+  bodyLimitHighlight: document.getElementById("bodyLimitHighlight"),
   imageInput: document.getElementById("imageInput"),
   imagePreview: document.getElementById("imagePreview"),
   controlPin: document.getElementById("controlPin"),
@@ -98,8 +101,10 @@ elements.shareMyListingButton.addEventListener("click", shareMyListing);
 elements.imageInput.addEventListener("change", handleImageInput);
 elements.imagePreview.addEventListener("click", handleImagePreviewClick);
 elements.controlPin.addEventListener("input", handleControlPinInput);
+elements.bodyText.addEventListener("scroll", syncBodyLimitHighlightScroll);
 
 applyTrainerInfo(currentTrainer);
+renderBodyLimitFeedback();
 renderPreview(currentImport);
 renderGroupOptions();
 renderImagePreview();
@@ -401,12 +406,14 @@ function resetProfile() {
 function handleTrainerFormInput(event) {
   if (!isTrainerFormField(event.target)) return;
   saveTrainerFromForm();
+  if (event.target === elements.bodyText) renderBodyLimitFeedback();
   updatePublishAvailability();
 }
 
 async function handleTrainerFormChange(event) {
   if (!isTrainerFormField(event.target)) return;
   saveTrainerFromForm();
+  if (event.target === elements.bodyText) renderBodyLimitFeedback();
   markLocalChange(elements.publishMessage, "트레이너 정보를 저장했습니다.");
 }
 
@@ -553,6 +560,7 @@ function updatePublishAvailability() {
   const validation = validateDraftForPublish(currentImport, {
     nickname: "placeholder",
     contact: "placeholder",
+    body: getBodyTextInput(),
   });
   const listingId = getPersonalListingShareId();
   const existingListing = getExistingPersonalListing();
@@ -561,7 +569,8 @@ function updatePublishAvailability() {
   const needsPin = listingStoreMode === "firebase" && !hasKnownControlPin;
   const pinIsUsable = listingStoreMode !== "firebase"
     || (pin ? isValidControlPin(pin) : !needsPin);
-  elements.publishButton.disabled = !validation.ok || !pinIsUsable;
+  const bodyIsWithinLimit = getRawBodyTextInput().length <= LISTING_BODY_MAX_LENGTH;
+  elements.publishButton.disabled = !validation.ok || !bodyIsWithinLimit || !pinIsUsable;
   elements.shareMyListingButton.disabled = listingStoreMode !== "firebase" || !listingId;
   elements.publishButton.textContent = getExistingPersonalListing() ? "교환 글 게시" : "교환 글 게시";
 }
@@ -649,6 +658,7 @@ function applyTrainerInfo(trainer) {
   elements.contact.value = trainer.contact ?? "";
   elements.bodyText.value = normalizeListingBodyInput(trainer.body);
   elements.transferWilling.checked = Boolean(trainer.transferWilling);
+  renderBodyLimitFeedback();
 }
 
 function saveTrainerFromForm(listingId = currentTrainer.listingId, hasControlPin = currentTrainer.hasControlPin) {
@@ -766,11 +776,10 @@ function reindexUserImages(images) {
 
 async function getPublishFormData() {
   const formData = getFormData();
-  const tradeSheetImages = await getReusableProfileSheetImages(currentImport);
   const userImages = getUserImagesForPublish();
   currentUserImages = userImages;
   saveTrainerFromForm();
-  formData.images = [...tradeSheetImages, ...userImages];
+  formData.images = userImages;
   formData.image = formData.images[0];
 
   return formData;
@@ -820,7 +829,56 @@ function getFormData() {
 }
 
 function normalizeListingBodyInput(value) {
-  return String(value ?? "").trim().slice(0, LISTING_BODY_MAX_LENGTH);
+  return String(value ?? "").trim().slice(0, BODY_TEXT_INPUT_MAX_LENGTH);
+}
+
+function getBodyTextInput() {
+  return normalizeListingBodyInput(elements.bodyText.value);
+}
+
+function getRawBodyTextInput() {
+  return String(elements.bodyText.value ?? "").slice(0, BODY_TEXT_INPUT_MAX_LENGTH);
+}
+
+function renderBodyLimitFeedback() {
+  const value = getRawBodyTextInput();
+  const count = value.length;
+  const overflowCount = Math.max(0, count - LISTING_BODY_MAX_LENGTH);
+
+  if (elements.bodyLimitCounter) {
+    elements.bodyLimitCounter.textContent = overflowCount > 0
+      ? `${count} / ${LISTING_BODY_MAX_LENGTH} (${overflowCount}자 초과)`
+      : `${count} / ${LISTING_BODY_MAX_LENGTH}`;
+    elements.bodyLimitCounter.classList.toggle("over-limit", overflowCount > 0);
+  }
+
+  renderBodyLimitHighlight(value, overflowCount);
+  syncBodyLimitHighlightScroll();
+}
+
+function renderBodyLimitHighlight(value, overflowCount) {
+  if (!elements.bodyLimitHighlight) return;
+  elements.bodyLimitHighlight.innerHTML = "";
+
+  if (overflowCount <= 0) {
+    elements.bodyLimitHighlight.append(document.createTextNode(value || ""));
+    return;
+  }
+
+  const allowedText = value.slice(0, LISTING_BODY_MAX_LENGTH);
+  const overflowText = value.slice(LISTING_BODY_MAX_LENGTH);
+  elements.bodyLimitHighlight.append(document.createTextNode(allowedText));
+
+  const overflow = document.createElement("span");
+  overflow.className = "overflow";
+  overflow.textContent = overflowText;
+  elements.bodyLimitHighlight.append(overflow);
+}
+
+function syncBodyLimitHighlightScroll() {
+  if (!elements.bodyLimitHighlight || !elements.bodyText) return;
+  elements.bodyLimitHighlight.scrollTop = elements.bodyText.scrollTop;
+  elements.bodyLimitHighlight.scrollLeft = elements.bodyText.scrollLeft;
 }
 
 function getControlPinValue() {
