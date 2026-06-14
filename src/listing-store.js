@@ -20,6 +20,7 @@ const FIREBASE_SDK_VERSION = "12.7.0";
 const LISTINGS_KEY = "pokemon-market-listings";
 const LISTINGS_SYNC_KEY = "pokemon-market-listings-sync";
 const FIREBASE_UID_KEY = "pokemon-market-firebase-uid";
+const LISTING_CONTROL_GRANTS_KEY = "pokemon-market-listing-control-grants";
 export const LISTINGS_REFRESH_KEY = "pokemon-market-listings-refresh";
 export const LISTINGS_BROADCAST_CHANNEL = "pokemon-market-listings";
 const LISTINGS_COLLECTION = "listings";
@@ -221,23 +222,32 @@ export async function ensureListingControl(listingId, pin = "", options = {}) {
 
   const user = firebase.auth.currentUser || (await firebase.signInAnonymously(firebase.auth)).user;
   let listing = normalizeKnownListingForControl(options.knownListing, normalizedListingId);
-  if (listing && (listing.ownerUid === user.uid || listing.id === user.uid)) {
+  if (listing && listing.ownerUid === user.uid) {
     return { listing, granted: false, owner: true };
+  }
+  if (listing && hasLocalListingControlGrant(listing, user.uid)) {
+    return { listing, granted: true, owner: false, cached: true };
   }
 
   if (!listing) {
     listing = await loadRemoteListingById(firebase, normalizedListingId);
   }
   if (!listing) throw createControlError("missing-listing", "게시글을 찾을 수 없습니다.");
-  if (listing.ownerUid === user.uid || listing.id === user.uid) {
+  if (listing.ownerUid === user.uid) {
     return { listing, granted: false, owner: true };
+  }
+  if (hasLocalListingControlGrant(listing, user.uid)) {
+    return { listing, granted: true, owner: false, cached: true };
   }
 
   if (!hasUsableControlPinFields(listing) && options.knownListing) {
     listing = await loadRemoteListingById(firebase, normalizedListingId);
     if (!listing) throw createControlError("missing-listing", "寃뚯떆湲??李얠쓣 ???놁뒿?덈떎.");
-    if (listing.ownerUid === user.uid || listing.id === user.uid) {
+    if (listing.ownerUid === user.uid) {
       return { listing, granted: false, owner: true };
+    }
+    if (hasLocalListingControlGrant(listing, user.uid)) {
+      return { listing, granted: true, owner: false, cached: true };
     }
   }
 
@@ -275,8 +285,8 @@ export async function ensureListingControl(listingId, pin = "", options = {}) {
     throw createControlError("pin-invalid", "관리 PIN이 일치하지 않습니다.");
   }
 
-  const updatedListing = await transferListingOwnerToCurrentUser(firebase, listing, user.uid, now);
-  return { listing: updatedListing, granted: true, owner: true, ownershipUpdated: true };
+  rememberLocalListingControlGrant(listing, user.uid, now);
+  return { listing, granted: true, owner: false };
 }
 
 function normalizeKnownListingForControl(listing, listingId) {
@@ -288,39 +298,60 @@ function hasUsableControlPinFields(listing) {
   return Boolean(listing?.hasControlPin && listing?.controlSalt && listing?.pinVersion);
 }
 
-async function transferListingOwnerToCurrentUser(firebase, listing, nextOwnerUid, updatedAt) {
-  if (!listing?.id || !nextOwnerUid || listing.ownerUid === nextOwnerUid) return listing;
-
-  const listingRef = firebase.doc(firebase.db, LISTINGS_COLLECTION, listing.id);
-  const secretRef = firebase.doc(firebase.db, LISTING_SECRETS_COLLECTION, listing.id);
-  const updatedListing = {
-    ...listing,
-    ownerUid: nextOwnerUid,
-  };
-  const listingPatch = compactListingForStorage(updatedListing);
-  const secretPatch = { ownerUid: nextOwnerUid, updatedAt };
-
-  if (firebase.writeBatch) {
-    const batch = firebase.writeBatch(firebase.db);
-    batch.set(listingRef, listingPatch);
-    batch.set(secretRef, secretPatch, { merge: true });
-    await batch.commit();
-  } else {
-    await firebase.setDoc(listingRef, listingPatch);
-    await firebase.setDoc(secretRef, secretPatch, { merge: true });
-  }
-
-  rememberFirebaseUid(nextOwnerUid);
-  updateLocalListingCache(updatedListing);
-  return updatedListing;
+function getLocalControlGrantKey(listingId, uid) {
+  return `${listingId}:${uid}`;
 }
 
-function rememberFirebaseUid(uid) {
+function loadLocalControlGrants() {
   try {
-    localStorage.setItem(FIREBASE_UID_KEY, uid);
+    const parsed = JSON.parse(localStorage.getItem(LISTING_CONTROL_GRANTS_KEY) || "{}");
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
   } catch {
-    // Browser key persistence is a convenience; Firestore ownerUid is the source of truth.
+    return {};
   }
+}
+
+function saveLocalControlGrants(grants) {
+  try {
+    localStorage.setItem(LISTING_CONTROL_GRANTS_KEY, JSON.stringify(grants));
+  } catch {
+    // A missing local grant only means the user may need to enter the PIN again.
+  }
+}
+
+function hasLocalListingControlGrant(listing, uid) {
+  if (!listing?.id || !uid || !listing.ownerUid || !listing.pinVersion) return false;
+  const grant = loadLocalControlGrants()[getLocalControlGrantKey(listing.id, uid)];
+  return Boolean(
+    grant
+      && grant.uid === uid
+      && grant.ownerUid === listing.ownerUid
+      && Number(grant.pinVersion) === Number(listing.pinVersion),
+  );
+}
+
+function rememberLocalListingControlGrant(listing, uid, grantedAt) {
+  if (!listing?.id || !uid || !listing.ownerUid || !listing.pinVersion) return;
+  const grants = loadLocalControlGrants();
+  grants[getLocalControlGrantKey(listing.id, uid)] = {
+    listingId: listing.id,
+    uid,
+    ownerUid: listing.ownerUid,
+    pinVersion: Number(listing.pinVersion),
+    grantedAt,
+  };
+  saveLocalControlGrants(pruneLocalControlGrants(grants));
+}
+
+function pruneLocalControlGrants(grants, limit = 80) {
+  const entries = Object.entries(grants || {});
+  if (entries.length <= limit) return grants;
+
+  return Object.fromEntries(
+    entries
+      .sort(([, a], [, b]) => String(b?.grantedAt || "").localeCompare(String(a?.grantedAt || "")))
+      .slice(0, limit),
+  );
 }
 
 function updateLocalListingCache(updatedListing) {
@@ -642,11 +673,33 @@ export async function savePersonalListing(draftListing, formData, options = {}) 
         ownerUid,
       }
     : null;
+  const grantRef = secret && user.uid !== ownerUid
+    ? firebase.doc(
+        firebase.db,
+        LISTING_CONTROL_GRANTS_COLLECTION,
+        listingId,
+        LISTING_CONTROL_GRANT_UIDS_COLLECTION,
+        user.uid,
+      )
+    : null;
+  const grant = grantRef
+    ? {
+        listingId,
+        uid: user.uid,
+        ownerUid,
+        pinHash: secret.pinHash,
+        pinVersion: Number(secret.pinVersion),
+        grantedAt: now,
+        updatedAt: now,
+      }
+    : null;
   const nextRevision = await writeListingAndMeta(firebase, listingRef, compactListingForStorage(listing), now, {
     detailRef,
     detail: compactListingDetailForStorage(listing),
     secretRef,
     secret,
+    grantRef,
+    grant,
   });
   await refreshRemoteListingsCount(firebase, nextRevision);
   await deleteStoragePaths(firebase, obsoleteStoragePaths);
@@ -654,6 +707,9 @@ export async function savePersonalListing(draftListing, formData, options = {}) 
   const localResult = upsertPersonalListing(loadLocalListings(), listing, formData ?? listing, {
     knownListingId: listingId,
   });
+  if (user.uid !== ownerUid && hasUsableControlPinFields(listing)) {
+    rememberLocalListingControlGrant(listing, user.uid, now);
+  }
   const localListings = [listing, ...localResult.listings.filter((localListing) => localListing.id !== listing.id)];
   saveLocalListings(localListings, createListingsSyncState(localListings, null, loadLocalSyncState()));
   announceListingsChanged({
@@ -1303,7 +1359,14 @@ async function refreshRemoteListingsCount(firebase, expectedRevision = null) {
 
 async function writeListingAndMeta(firebase, listingRef, listing, updatedAt, options = {}) {
   const metaRef = firebase.doc(firebase.db, META_COLLECTION, LISTINGS_META_DOCUMENT);
-  const { detailRef = null, detail = null, secretRef = null, secret = null } = options;
+  const {
+    detailRef = null,
+    detail = null,
+    secretRef = null,
+    secret = null,
+    grantRef = null,
+    grant = null,
+  } = options;
 
   if (firebase.runTransaction) {
     return firebase.runTransaction(firebase.db, async (transaction) => {
@@ -1313,6 +1376,7 @@ async function writeListingAndMeta(firebase, listingRef, listing, updatedAt, opt
       transaction.set(listingRef, listing);
       if (detailRef && detail) transaction.set(detailRef, detail);
       if (secretRef && secret) transaction.set(secretRef, secret, { merge: true });
+      if (grantRef && grant) transaction.set(grantRef, grant, { merge: true });
       transaction.set(metaRef, {
         revision: nextRevision,
         updatedAt,
@@ -1332,6 +1396,7 @@ async function writeListingAndMeta(firebase, listingRef, listing, updatedAt, opt
     batch.set(listingRef, listing);
     if (detailRef && detail) batch.set(detailRef, detail);
     if (secretRef && secret) batch.set(secretRef, secret, { merge: true });
+    if (grantRef && grant) batch.set(grantRef, grant, { merge: true });
     batch.set(metaRef, metaPatch, { merge: true });
     await batch.commit();
     return null;
@@ -1340,6 +1405,7 @@ async function writeListingAndMeta(firebase, listingRef, listing, updatedAt, opt
   await firebase.setDoc(listingRef, listing);
   if (detailRef && detail) await firebase.setDoc(detailRef, detail);
   if (secretRef && secret) await firebase.setDoc(secretRef, secret, { merge: true });
+  if (grantRef && grant) await firebase.setDoc(grantRef, grant, { merge: true });
   await firebase.setDoc(metaRef, metaPatch, { merge: true });
   return null;
 }
