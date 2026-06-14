@@ -35,6 +35,7 @@ const IMAGE_FOLDER = "listing-images";
 const SYNC_CACHE_VERSION = 5;
 const INCREMENTAL_SYNC_MAX_AGE_DAYS = 25;
 export const DEFAULT_LISTINGS_PAGE_SIZE = 10;
+export const DEFAULT_LISTING_SORT_CANDIDATE_LIMIT = 200;
 const STORAGE_CACHE_CONTROL = "public,max-age=31536000,immutable";
 const CONTROL_PIN_HASH_ITERATIONS = 120000;
 const CONTROL_PIN_HASH_ALGORITHM = "PBKDF2-SHA256";
@@ -87,6 +88,9 @@ export async function loadListingPage(options = {}) {
     ? Math.floor(Number(options.pageIndex))
     : 0;
   const requiredCount = (pageIndex + 1) * pageSize;
+  const candidateLimit = Number.isFinite(Number(options.candidateLimit)) && Number(options.candidateLimit) > 0
+    ? Math.max(pageSize, Math.floor(Number(options.candidateLimit)))
+    : DEFAULT_LISTING_SORT_CANDIDATE_LIMIT;
   const firebase = await getFirebaseReadState();
 
   if (!firebase) {
@@ -99,6 +103,7 @@ export async function loadListingPage(options = {}) {
     const syncState = loadLocalSyncState();
     const activeCachedListings = sortListingsByCreatedAtDesc(cachedListings);
     let remoteMeta = await loadRemoteListingsMeta(firebase);
+    const requiredCandidateCount = getRequiredListingCandidateCount(remoteMeta, requiredCount, candidateLimit);
     let listings = activeCachedListings;
     let source = "cache";
 
@@ -107,7 +112,7 @@ export async function loadListingPage(options = {}) {
       source = "page";
     }
 
-    if (remoteMeta && shouldUseCachedListings(syncState, remoteMeta) && hasEnoughListingsForPage(activeCachedListings, remoteMeta, requiredCount)) {
+    if (remoteMeta && shouldUseCachedListings(syncState, remoteMeta) && hasEnoughListingsForPage(activeCachedListings, remoteMeta, requiredCandidateCount)) {
       return createListingPageResult(activeCachedListings, remoteMeta.activeCount, source, pageIndex, pageSize);
     }
 
@@ -120,7 +125,7 @@ export async function loadListingPage(options = {}) {
       saveLocalListings(listings, createListingsSyncState(listings, remoteMeta, syncState));
       source = "incremental";
 
-      if (hasEnoughListingsForPage(listings, remoteMeta, requiredCount)) {
+      if (hasEnoughListingsForPage(listings, remoteMeta, requiredCandidateCount)) {
         return createListingPageResult(listings, remoteMeta.activeCount, source, pageIndex, pageSize);
       }
     } else if (remoteMeta && !shouldUseCachedListings(syncState, remoteMeta) && !canLoadIncrementalChanges(syncState)) {
@@ -128,15 +133,18 @@ export async function loadListingPage(options = {}) {
       source = "page";
     }
 
-    if (remoteMeta && shouldUseCachedListings(syncState, remoteMeta) && !hasEnoughListingsForPage(listings, remoteMeta, requiredCount)) {
-      listings = [];
-      source = "page";
+    if (remoteMeta && shouldUseCachedListings(syncState, remoteMeta) && !hasEnoughListingsForPage(listings, remoteMeta, requiredCandidateCount)) {
+      source = "cache-page";
     }
 
-    while (!hasEnoughListingsForPage(listings, remoteMeta, requiredCount)) {
+    while (!hasEnoughListingsForPage(listings, remoteMeta, requiredCandidateCount)) {
+      const loadPageSize = Math.max(
+        pageSize,
+        Math.min(requiredCandidateCount - filterActiveListings(listings).length, candidateLimit),
+      );
       const nextListings = await loadRemoteListingPage(firebase, {
         cursor: getListingPageCursor(listings),
-        pageSize,
+        pageSize: loadPageSize,
       });
 
       if (nextListings.length === 0) break;
@@ -144,7 +152,7 @@ export async function loadListingPage(options = {}) {
       listings = sortListingsByCreatedAtDesc(mergeListingChanges(listings, nextListings));
       source = source === "incremental" ? "incremental-page" : "page";
 
-      if (nextListings.length < pageSize) break;
+      if (nextListings.length < loadPageSize) break;
     }
 
     saveLocalListings(listings, createListingsSyncState(listings, remoteMeta, syncState));
@@ -542,6 +550,23 @@ function compareListingFreshness(listing, deletion) {
   return listingTime > deletionTime ? 1 : -1;
 }
 
+function getRequiredListingCandidateCount(remoteMeta = null, requiredCount = DEFAULT_LISTINGS_PAGE_SIZE, candidateLimit = DEFAULT_LISTING_SORT_CANDIDATE_LIMIT) {
+  const safeRequiredCount = Number.isFinite(Number(requiredCount)) && Number(requiredCount) > 0
+    ? Math.floor(Number(requiredCount))
+    : DEFAULT_LISTINGS_PAGE_SIZE;
+  const safeCandidateLimit = Number.isFinite(Number(candidateLimit)) && Number(candidateLimit) > 0
+    ? Math.max(DEFAULT_LISTINGS_PAGE_SIZE, Math.floor(Number(candidateLimit)))
+    : DEFAULT_LISTING_SORT_CANDIDATE_LIMIT;
+  const activeCount = remoteMeta?.activeCount != null && Number.isFinite(Number(remoteMeta.activeCount))
+    ? Math.max(0, Math.floor(Number(remoteMeta.activeCount)))
+    : null;
+  const cappedCandidateCount = activeCount == null
+    ? safeCandidateLimit
+    : Math.min(activeCount, safeCandidateLimit);
+
+  return Math.max(safeRequiredCount, cappedCandidateCount);
+}
+
 function createListingPageResult(listings = [], totalCount = null, source = "unknown", pageIndex = 0, pageSize = DEFAULT_LISTINGS_PAGE_SIZE) {
   const activeListings = filterActiveListings(listings);
   const normalizedTotalCount = totalCount != null && Number.isFinite(Number(totalCount))
@@ -555,6 +580,8 @@ function createListingPageResult(listings = [], totalCount = null, source = "unk
 
   return {
     listings: pageListings,
+    candidates: activeListings,
+    candidateCount: activeListings.length,
     cachedCount: activeListings.length,
     loadedCount: pageListings.length,
     pageIndex: safePageIndex,

@@ -43,7 +43,7 @@ const koreanNameCollator = new Intl.Collator("ko-KR", {
 
 const catalogIndex = createCatalogIndex(stickers);
 const catalogItems = catalogIndex.stickers;
-let currentImport = refreshImportedData(loadProfile() || createEmptyProfile(), catalogIndex);
+let currentImport = normalizeOwnedLayoutProfile(refreshImportedData(loadProfile() || createEmptyProfile(), catalogIndex));
 let currentTrainer = loadTrainerInfo();
 let currentUserImages = getTrainerUserImages(currentTrainer);
 let listingStoreMode = "local";
@@ -64,6 +64,7 @@ const elements = {
   previewContent: document.getElementById("previewContent"),
   wantedPreview: document.getElementById("wantedPreview"),
   ownedPreview: document.getElementById("ownedPreview"),
+  ownedLayoutMode: document.getElementById("ownedLayoutMode"),
   targetGroup: document.getElementById("targetGroup"),
   stickerSearch: document.getElementById("stickerSearch"),
   searchResults: document.getElementById("searchResults"),
@@ -90,6 +91,7 @@ elements.clearButton.addEventListener("click", clearImportInput);
 elements.previewContent.addEventListener("click", handlePreviewClick);
 elements.previewContent.addEventListener("input", handlePreviewInput);
 elements.previewContent.addEventListener("change", handlePreviewChange);
+elements.ownedLayoutMode.addEventListener("change", handleOwnedLayoutModeChange);
 elements.targetGroup.addEventListener("change", renderSearchResults);
 elements.stickerSearch.addEventListener("input", renderSearchResults);
 elements.searchResults.addEventListener("click", handleSearchResultClick);
@@ -137,7 +139,9 @@ async function parseInput() {
   setMessage(elements.publishMessage, "");
 
   try {
-    currentImport = refreshImportedData(parseReferenceInput(elements.importInput.value, catalogIndex, { allowJson: false }), catalogIndex);
+    currentImport = normalizeOwnedLayoutProfile(
+      refreshImportedData(parseReferenceInput(elements.importInput.value, catalogIndex, { allowJson: false }), catalogIndex),
+    );
     clearGeneratedImage();
     clearListingCache();
     listingsCache = [];
@@ -248,6 +252,7 @@ function renderValidation(importedData) {
 
 function renderGroupOptions() {
   const previousValue = elements.targetGroup.value;
+  syncOwnedLayoutModeControls();
   elements.targetGroup.innerHTML = "";
 
   for (const group of currentImport.wantedGroups) {
@@ -270,6 +275,114 @@ function createGroupOption(group, prefix) {
   option.value = group.id;
   option.textContent = `${prefix} · ${group.label}`;
   return option;
+}
+
+function getOwnedLayoutMode(profile = currentImport) {
+  if (profile?.haveLayoutMode === "single") return "single";
+  if ((profile?.ownedGroups || []).some((group) => group?.id === "have-single")) return "single";
+  return "split";
+}
+
+function syncOwnedLayoutModeControls() {
+  const mode = getOwnedLayoutMode(currentImport);
+  for (const input of elements.ownedLayoutMode.querySelectorAll("input[name='ownedLayoutMode']")) {
+    input.checked = input.value === mode;
+  }
+}
+
+function handleOwnedLayoutModeChange(event) {
+  const input = event.target.closest("input[name='ownedLayoutMode']");
+  if (!input) return;
+
+  const nextMode = input.value === "single" ? "single" : "split";
+  if (getOwnedLayoutMode(currentImport) === nextMode) {
+    syncOwnedLayoutModeControls();
+    return;
+  }
+
+  currentImport = normalizeOwnedLayoutProfile({
+    ...currentImport,
+    haveLayoutMode: nextMode,
+    ownedGroups: createOwnedGroupsForMode(currentImport, nextMode),
+  });
+  clearGeneratedImage();
+  saveProfile(currentImport);
+  renderPreview(currentImport);
+  renderGroupOptions();
+  markLocalChange(elements.editMessage, "보유중 표시 방식을 변경했습니다.");
+}
+
+function normalizeOwnedLayoutProfile(profile) {
+  const mode = getOwnedLayoutMode(profile);
+  return {
+    ...profile,
+    haveLayoutMode: mode,
+    ownedGroups: createOwnedGroupsForMode(profile, mode),
+  };
+}
+
+function createOwnedGroupsForMode(profile, mode) {
+  return mode === "single"
+    ? [createSingleOwnedGroup(collectUniqueOwnedItems(profile?.ownedGroups), getFirstOwnedSubtitle(profile?.ownedGroups))]
+    : createSplitOwnedGroups(profile?.ownedGroups);
+}
+
+function createSingleOwnedGroup(items = [], subtitle = "") {
+  return {
+    id: "have-single",
+    label: "통합",
+    subtitle,
+    items,
+  };
+}
+
+function createSplitOwnedGroups(groups = []) {
+  const currentMode = getOwnedLayoutMode({ ownedGroups: groups });
+  const sourceGroups = groups || [];
+
+  if (currentMode === "single") {
+    return [0, 1, 2, 3].map((index) => createSplitOwnedGroup(
+      index,
+      index === 0 ? collectUniqueOwnedItems(sourceGroups) : [],
+      index === 0 ? getFirstOwnedSubtitle(sourceGroups) : "",
+    ));
+  }
+
+  return [0, 1, 2, 3].map((index) => {
+    const source = sourceGroups.find((group) => group?.id === `have-split-${index}`) || sourceGroups[index];
+    return createSplitOwnedGroup(index, source?.items || [], source?.subtitle || "");
+  });
+}
+
+function createSplitOwnedGroup(index, items = [], subtitle = "") {
+  return {
+    id: `have-split-${index}`,
+    label: `보유 ${index + 1}`,
+    subtitle,
+    items,
+  };
+}
+
+function collectUniqueOwnedItems(groups = []) {
+  const seen = new Set();
+  const items = [];
+
+  for (const group of groups || []) {
+    for (const item of group?.items || []) {
+      const key = getItemKey(item) || item?.rawKey || item?.key || item?.name || "";
+      const dedupeKey = key || `${items.length}`;
+      if (seen.has(dedupeKey)) continue;
+      seen.add(dedupeKey);
+      items.push(item);
+    }
+  }
+
+  return items;
+}
+
+function getFirstOwnedSubtitle(groups = []) {
+  const group = (groups || []).find((candidate) => String(candidate?.subtitle || "").trim());
+  return String(group?.subtitle || "").trim();
 }
 
 function renderSearchResults() {
@@ -380,7 +493,7 @@ function findGroup(groupId) {
 }
 
 function persistProfile(message) {
-  currentImport = refreshImportedData(currentImport, catalogIndex);
+  currentImport = normalizeOwnedLayoutProfile(refreshImportedData(currentImport, catalogIndex));
   clearGeneratedImage();
   saveProfile(currentImport);
   renderPreview(currentImport);

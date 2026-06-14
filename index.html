@@ -31,7 +31,7 @@
               <div>
                 <h2>내 교환 목록</h2>
                 <p>공유 코드로 시작하거나, 아래 수정 도구로 구해요/보유중 목록을 작성하세요.</p>
-                <p>개별 스티커 이미지 자료는 두래고니님의 도감표를 참고했습니다. https://blog.naver.com/dragoni_/224285285401</p>
+                <p>이미지 자료는 두래고니님의 도감표를 참고했습니다. https://blog.naver.com/dragoni_/224285285401</p>
               </div>
               <span id="previewMeta" class="badge dark">대기 중</span>
             </div>
@@ -114,12 +114,24 @@
             <div class="section-title">
               <div>
                 <h2>목록 직접 수정</h2>
-                <p>공유 코드가 없어도 원하는 목록을 선택해 스티커를 추가하거나, 목록의 스티커를 눌러 제거할 수 있습니다.
-
-                  비어있는 항목은 칸 구분이 자동으로 사라집니다. (보유중의 1번칸만 채울 시 오른쪽 영역이 통째로 1칸이 됩니다.)
-                </p>
+                <p>공유 코드가 없어도 원하는 목록을 선택해 스티커를 추가하거나, 목록의 스티커를 눌러 제거할 수 있습니다.</p>
+                <p>비어있는 항목의 영역은 자동으로 사라집니다.</p>
               </div>
             </div>
+
+            <fieldset id="ownedLayoutMode" class="mode-field compact-mode-field">
+              <legend>보유중 표시 방식</legend>
+              <div class="segmented-control compact">
+                <label>
+                  <input type="radio" name="ownedLayoutMode" value="split" />
+                  <span>분할 모드</span>
+                </label>
+                <label>
+                  <input type="radio" name="ownedLayoutMode" value="single" />
+                  <span>통합 모드</span>
+                </label>
+              </div>
+            </fieldset>
 
             <label class="field">
               <span>목록</span>

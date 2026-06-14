@@ -15,6 +15,7 @@ import {
   saveGeneratedSheetBlob,
 } from "./generated-sheet-cache.js";
 import {
+  DEFAULT_LISTING_SORT_CANDIDATE_LIMIT,
   DEFAULT_LISTINGS_PAGE_SIZE,
   deleteControlledListing,
   deletePersonalListing,
@@ -143,7 +144,10 @@ async function initializeListingsPage() {
       : "게시판에 접근할 수 없습니다.";
 
   if (listingStoreMode === "firebase") {
-    const cachedListings = sortListingsForProfile(loadCachedListings().slice(0, DEFAULT_LISTINGS_PAGE_SIZE), loadProfile());
+    const cachedListings = sortListingsForProfile(
+      loadCachedListings().slice(0, DEFAULT_LISTING_SORT_CANDIDATE_LIMIT),
+      loadProfile(),
+    ).slice(0, DEFAULT_LISTINGS_PAGE_SIZE);
     if (!sharedListingId && cachedListings.length > 0) {
       await prepareGeneratedSheetSourcesForRender(cachedListings);
       renderListingCards(cachedListings, {
@@ -173,8 +177,13 @@ async function renderListings(pageIndex = paginationState.pageIndex || 0, option
   const result = await loadStoredListingPage({
     pageIndex,
     pageSize: DEFAULT_LISTINGS_PAGE_SIZE,
+    candidateLimit: DEFAULT_LISTING_SORT_CANDIDATE_LIMIT,
   });
-  const listings = sortListingsForProfile(result.listings, currentProfile);
+  const sortedResult = focusListingPageResult(
+    createProfileSortedPageResult(result, currentProfile),
+    options.focusListingId,
+  );
+  const listings = sortedResult.listings;
   if (canReuseRenderedListingCards(listings, options)) {
     rememberRenderedListings(listings);
   } else {
@@ -183,11 +192,70 @@ async function renderListings(pageIndex = paginationState.pageIndex || 0, option
       preserveGeneratedSheetObjectUrls: true,
     });
   }
-  renderPagination(result);
+  renderPagination(sortedResult);
 
   if (options.focusListingId) {
     requestAnimationFrame(() => scrollToListingCard(options.focusListingId));
   }
+}
+
+function createProfileSortedPageResult(result = {}, profile = null) {
+  const candidates = Array.isArray(result.candidates) ? result.candidates : result.listings || [];
+  const sortedCandidates = sortListingsForProfile(candidates, profile);
+  const pageSize = Number.isFinite(Number(result.pageSize)) && Number(result.pageSize) > 0
+    ? Math.floor(Number(result.pageSize))
+    : DEFAULT_LISTINGS_PAGE_SIZE;
+  const normalizedTotalCount = Number.isFinite(Number(result.totalCount))
+    ? Number(result.totalCount)
+    : sortedCandidates.length;
+  const totalCount = Math.max(sortedCandidates.length, normalizedTotalCount);
+  const totalPages = Math.max(1, Math.ceil(totalCount / pageSize));
+  const pageIndex = Math.min(Math.max(0, Number(result.pageIndex || 0)), totalPages - 1);
+  const startIndex = pageIndex * pageSize;
+  const listings = sortedCandidates.slice(startIndex, startIndex + pageSize);
+
+  return {
+    ...result,
+    listings,
+    candidates: sortedCandidates,
+    candidateCount: sortedCandidates.length,
+    loadedCount: listings.length,
+    pageIndex,
+    pageSize,
+    startItem: listings.length > 0 ? startIndex + 1 : 0,
+    endItem: listings.length > 0 ? startIndex + listings.length : 0,
+    totalCount,
+    totalPages,
+    hasNextPage: pageIndex < totalPages - 1,
+    hasPreviousPage: pageIndex > 0,
+    hasMore: sortedCandidates.length < totalCount,
+  };
+}
+
+function focusListingPageResult(result = {}, listingId = "") {
+  if (!listingId || !Array.isArray(result.candidates) || result.candidates.length === 0) return result;
+
+  const candidateIndex = result.candidates.findIndex((listing) => listing?.id === listingId);
+  if (candidateIndex < 0) return result;
+
+  const pageSize = Number.isFinite(Number(result.pageSize)) && Number(result.pageSize) > 0
+    ? Math.floor(Number(result.pageSize))
+    : DEFAULT_LISTINGS_PAGE_SIZE;
+  const pageIndex = Math.floor(candidateIndex / pageSize);
+  if (pageIndex === result.pageIndex) return result;
+
+  const startIndex = pageIndex * pageSize;
+  const listings = result.candidates.slice(startIndex, startIndex + pageSize);
+  return {
+    ...result,
+    listings,
+    loadedCount: listings.length,
+    pageIndex,
+    startItem: listings.length > 0 ? startIndex + 1 : 0,
+    endItem: listings.length > 0 ? startIndex + listings.length : 0,
+    hasNextPage: pageIndex < result.totalPages - 1,
+    hasPreviousPage: pageIndex > 0,
+  };
 }
 
 async function goToListingsPage(pageIndex) {
