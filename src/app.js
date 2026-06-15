@@ -30,6 +30,9 @@ const BODY_TEXT_INPUT_MAX_LENGTH = 1000;
 const STORED_IMAGE_TYPE = "image/webp";
 const STORED_IMAGE_QUALITY = 0.82;
 const MAX_USER_IMAGES = 5;
+const LISTING_SHARE_PARAM = "listing";
+const LISTING_RESTORE_PARAM = "restore";
+const LEGACY_LISTING_RESTORE_PARAM = "restoreListing";
 const REFERENCE_ASSET_ORIGIN = "public";
 const SHEET_WIDTH = 2200;
 const SHEET_HEIGHT = 1400;
@@ -50,6 +53,7 @@ let currentTrainer = loadTrainerInfo();
 let currentUserImages = getTrainerUserImages(currentTrainer);
 let listingStoreMode = "local";
 let listingsCache = [];
+let initialRestorePromptHandled = false;
 let sheetImageCache = {
   signature: "",
   images: [],
@@ -684,10 +688,10 @@ async function restoreMyListing(event) {
   }
 
   try {
-    const { listingId, pin } = await requestListingRestoreInput(getPersonalListingShareId());
-    const { listing } = await ensureListingControl(listingId, pin);
+    const { listing } = await requestListingRestoreControl();
     const listingWithDetails = await loadListingWithDetails(listing);
     if (!listingWithDetails) throw new Error("게시글을 찾을 수 없습니다.");
+    saveRestoreListingId(listingWithDetails.id);
 
     if (!window.confirm("현재 마이페이지 내용을 업로드된 게시글 내용으로 덮어쓰겠습니다.")) return;
 
@@ -700,6 +704,59 @@ async function restoreMyListing(event) {
       : error?.message || "게시글을 불러오지 못했습니다.";
     setMessage(elements.publishMessage, message, "error");
   }
+}
+
+async function requestListingRestoreControl() {
+  const savedListingId = getSavedRestoreListingId();
+
+  if (savedListingId) {
+    try {
+      return await ensureListingControl(savedListingId, "", {
+        knownListing: getExistingPersonalListing(),
+      });
+    } catch (error) {
+      if (error?.code === "pin-required") {
+        return requestListingRestoreControlFromInput(savedListingId, {
+          focusPin: true,
+        });
+      }
+      if (isMissingListingError(error)) {
+        return requestListingRestoreControlFromInput(savedListingId, {
+          errorMessage: "게시글을 찾을 수 없습니다. 링크 또는 ID를 다시 확인하세요.",
+        });
+      }
+      throw error;
+    }
+  }
+
+  return requestListingRestoreControlFromInput("");
+}
+
+async function requestListingRestoreControlFromInput(defaultListingId = "", options = {}) {
+  let nextDefaultListingId = defaultListingId;
+  let errorMessage = options.errorMessage || "";
+  let focusPin = Boolean(options.focusPin && defaultListingId);
+
+  while (true) {
+    const { listingId, pin } = await requestListingRestoreInput(nextDefaultListingId, {
+      errorMessage,
+      focusPin,
+    });
+    nextDefaultListingId = listingId;
+    errorMessage = "";
+    focusPin = false;
+
+    try {
+      return await ensureListingControl(listingId, pin);
+    } catch (error) {
+      if (!isMissingListingError(error)) throw error;
+      errorMessage = "게시글을 찾을 수 없습니다. 링크 또는 ID를 다시 확인하세요.";
+    }
+  }
+}
+
+function isMissingListingError(error) {
+  return error?.code === "missing-listing";
 }
 
 function updatePublishAvailability() {
@@ -772,6 +829,20 @@ function getPersonalListingShareId() {
   return getExistingPersonalListing()?.id || currentTrainer.listingId || "";
 }
 
+function getSavedRestoreListingId() {
+  return currentTrainer.restoreListingId || currentTrainer.listingId || "";
+}
+
+function saveRestoreListingId(listingId) {
+  const normalizedListingId = String(listingId ?? "").trim();
+  if (!normalizedListingId) return;
+  currentTrainer = {
+    ...currentTrainer,
+    restoreListingId: normalizedListingId,
+  };
+  saveTrainerInfo(currentTrainer);
+}
+
 function createListingShareUrl(listingId) {
   const url = new URL("./listings.html", window.location.href);
   url.searchParams.set("listing", listingId);
@@ -791,17 +862,22 @@ function extractListingIdInput(value) {
   }
 }
 
-function requestListingRestoreInput(defaultListingId = "") {
+function requestListingRestoreInput(defaultListingId = "", options = {}) {
   const dialog = getListingRestoreDialog();
   const form = dialog.querySelector("form");
   const listingInput = dialog.querySelector("[data-restore-listing-id]");
   const pinInput = dialog.querySelector("[data-restore-pin]");
+  const messageElement = dialog.querySelector("[data-restore-message]");
   const cancelButton = dialog.querySelector("[data-restore-cancel]");
 
   listingInput.value = defaultListingId || "";
   pinInput.value = "";
+  if (messageElement) {
+    messageElement.textContent = options.errorMessage || "";
+    messageElement.classList.toggle("hidden", !options.errorMessage);
+  }
   dialog.classList.remove("hidden");
-  listingInput.focus();
+  (options.focusPin && defaultListingId ? pinInput : listingInput).focus();
 
   return new Promise((resolve, reject) => {
     const cleanup = () => {
@@ -852,6 +928,7 @@ function getListingRestoreDialog() {
   dialog.innerHTML = `
     <form class="control-pin-box">
       <h2>게시글 불러오기</h2>
+      <p class="message compact error hidden" data-restore-message></p>
       <label class="field">
         <span>게시글 ID 또는 공유 링크</span>
         <input type="text" data-restore-listing-id required />
@@ -885,6 +962,7 @@ function overwriteMypageFromListing(listing) {
   }, catalogIndex));
   const trainer = {
     listingId: listing?.id || "",
+    restoreListingId: listing?.id || "",
     hasControlPin: Boolean(listing?.hasControlPin),
     nickname: listing?.nickname || "",
     contact: listing?.contact || "",
@@ -943,9 +1021,14 @@ function applyTrainerInfo(trainer) {
   renderBodyLimitFeedback();
 }
 
-function saveTrainerFromForm(listingId = currentTrainer.listingId, hasControlPin = currentTrainer.hasControlPin) {
+function saveTrainerFromForm(
+  listingId = currentTrainer.listingId,
+  hasControlPin = currentTrainer.hasControlPin,
+  restoreListingId = listingId || currentTrainer.restoreListingId,
+) {
   currentTrainer = {
     listingId,
+    restoreListingId: restoreListingId || "",
     hasControlPin: Boolean(hasControlPin),
     nickname: elements.nickname.value,
     contact: elements.contact.value,
@@ -1001,6 +1084,7 @@ function loadTrainerInfo() {
   try {
     return {
       listingId: "",
+      restoreListingId: "",
       hasControlPin: false,
       nickname: "",
       contact: "",
@@ -1012,6 +1096,7 @@ function loadTrainerInfo() {
   } catch {
     return {
       listingId: "",
+      restoreListingId: "",
       hasControlPin: false,
       nickname: "",
       contact: "",
