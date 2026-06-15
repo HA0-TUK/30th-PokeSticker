@@ -13,9 +13,11 @@ import {
 } from "./importer.js";
 import {
   clearListingCache,
+  ensureListingControl,
   getListingStoreMode,
   isValidControlPin,
   loadCachedListings,
+  loadListingWithDetails,
   loadListings as loadStoredListings,
   loadPersonalListing,
   savePersonalListing,
@@ -82,6 +84,7 @@ const elements = {
   transferWilling: document.getElementById("transferWilling"),
   publishButton: document.getElementById("publishButton"),
   shareMyListingButton: document.getElementById("shareMyListingButton"),
+  restoreMyListingButton: document.getElementById("restoreMyListingButton"),
   publishMessage: document.getElementById("publishMessage"),
 };
 
@@ -101,6 +104,7 @@ elements.publishForm.addEventListener("input", handleTrainerFormInput);
 elements.publishForm.addEventListener("change", handleTrainerFormChange);
 elements.publishButton.addEventListener("click", publishListing);
 elements.shareMyListingButton.addEventListener("click", shareMyListing);
+elements.restoreMyListingButton.addEventListener("click", restoreMyListing);
 elements.imageInput.addEventListener("change", handleImageInput);
 elements.imagePreview.addEventListener("click", handleImagePreviewClick);
 elements.controlPin.addEventListener("input", handleControlPinInput);
@@ -670,6 +674,34 @@ async function shareMyListing(event) {
   }
 }
 
+async function restoreMyListing(event) {
+  event.preventDefault();
+  setMessage(elements.publishMessage, "");
+
+  if (listingStoreMode !== "firebase") {
+    setMessage(elements.publishMessage, "Firebase 연결 상태에서만 게시글을 불러올 수 있습니다.", "error");
+    return;
+  }
+
+  try {
+    const { listingId, pin } = await requestListingRestoreInput(getPersonalListingShareId());
+    const { listing } = await ensureListingControl(listingId, pin);
+    const listingWithDetails = await loadListingWithDetails(listing);
+    if (!listingWithDetails) throw new Error("게시글을 찾을 수 없습니다.");
+
+    if (!window.confirm("현재 마이페이지 내용을 업로드된 게시글 내용으로 덮어쓰겠습니다.")) return;
+
+    overwriteMypageFromListing(listingWithDetails);
+    setMessage(elements.publishMessage, "업로드된 게시글 내용으로 마이페이지를 업데이트했습니다.", "success");
+  } catch (error) {
+    if (error?.code === "restore-cancelled") return;
+    const message = error?.code === "pin-required"
+      ? "다른 기기에서 불러오려면 관리 PIN을 입력해야 합니다."
+      : error?.message || "게시글을 불러오지 못했습니다.";
+    setMessage(elements.publishMessage, message, "error");
+  }
+}
+
 function updatePublishAvailability() {
   const validation = validateDraftForPublish(currentImport, {
     nickname: "placeholder",
@@ -686,6 +718,7 @@ function updatePublishAvailability() {
   const bodyIsWithinLimit = getRawBodyTextInput().length <= LISTING_BODY_MAX_LENGTH;
   elements.publishButton.disabled = !validation.ok || !bodyIsWithinLimit || !pinIsUsable;
   elements.shareMyListingButton.disabled = listingStoreMode !== "firebase" || !listingId;
+  elements.restoreMyListingButton.disabled = listingStoreMode !== "firebase";
   elements.publishButton.textContent = getExistingPersonalListing() ? "교환 글 게시" : "교환 글 게시";
 }
 
@@ -744,6 +777,141 @@ function createListingShareUrl(listingId) {
   url.searchParams.set("listing", listingId);
   url.hash = "";
   return url.toString();
+}
+
+function extractListingIdInput(value) {
+  const text = String(value ?? "").trim();
+  if (!text) return "";
+
+  try {
+    const url = new URL(text, window.location.href);
+    return String(url.searchParams.get("listing") || text).trim();
+  } catch {
+    return text;
+  }
+}
+
+function requestListingRestoreInput(defaultListingId = "") {
+  const dialog = getListingRestoreDialog();
+  const form = dialog.querySelector("form");
+  const listingInput = dialog.querySelector("[data-restore-listing-id]");
+  const pinInput = dialog.querySelector("[data-restore-pin]");
+  const cancelButton = dialog.querySelector("[data-restore-cancel]");
+
+  listingInput.value = defaultListingId || "";
+  pinInput.value = "";
+  dialog.classList.remove("hidden");
+  listingInput.focus();
+
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      form.removeEventListener("submit", handleSubmit);
+      cancelButton.removeEventListener("click", handleCancel);
+      dialog.classList.add("hidden");
+    };
+    const handleCancel = () => {
+      cleanup();
+      reject(createAppUiError("restore-cancelled", "게시글 불러오기를 취소했습니다."));
+    };
+    const handleSubmit = (event) => {
+      event.preventDefault();
+      const listingId = extractListingIdInput(listingInput.value);
+      const pin = pinInput.value.trim();
+
+      if (!listingId) {
+        listingInput.setCustomValidity("게시글 ID 또는 공유 링크를 입력하세요.");
+        listingInput.reportValidity();
+        listingInput.setCustomValidity("");
+        return;
+      }
+      if (pin && !isValidControlPin(pin)) {
+        pinInput.setCustomValidity("PIN은 숫자 4자리여야 합니다.");
+        pinInput.reportValidity();
+        pinInput.setCustomValidity("");
+        return;
+      }
+
+      cleanup();
+      resolve({ listingId, pin });
+    };
+
+    form.addEventListener("submit", handleSubmit);
+    cancelButton.addEventListener("click", handleCancel);
+  });
+}
+
+function getListingRestoreDialog() {
+  let dialog = document.getElementById("listingRestoreDialog");
+  if (dialog) return dialog;
+
+  dialog = document.createElement("div");
+  dialog.id = "listingRestoreDialog";
+  dialog.className = "control-pin-dialog hidden";
+  dialog.setAttribute("role", "dialog");
+  dialog.setAttribute("aria-modal", "true");
+  dialog.innerHTML = `
+    <form class="control-pin-box">
+      <h2>게시글 불러오기</h2>
+      <label class="field">
+        <span>게시글 ID 또는 공유 링크</span>
+        <input type="text" data-restore-listing-id required />
+      </label>
+      <label class="field">
+        <span>관리 PIN</span>
+        <input type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="4" pattern="[0-9]{4}" data-restore-pin placeholder="같은 기기면 비워도 됩니다" />
+      </label>
+      <div class="actions">
+        <button type="submit">불러오기</button>
+        <button type="button" class="secondary" data-restore-cancel>취소</button>
+      </div>
+    </form>
+  `;
+  dialog.querySelector("[data-restore-pin]").addEventListener("input", (event) => {
+    event.target.value = event.target.value.replace(/\D+/g, "").slice(0, 4);
+  });
+  document.body.append(dialog);
+  return dialog;
+}
+
+function overwriteMypageFromListing(listing) {
+  const now = new Date().toISOString();
+  const profile = normalizeOwnedLayoutProfile(refreshImportedData({
+    source: "controlled-listing",
+    importedAt: now,
+    haveLayoutMode: getOwnedLayoutMode({ ownedGroups: listing?.ownedGroups || [] }),
+    wantedGroups: listing?.wantedGroups || [],
+    ownedGroups: listing?.ownedGroups || [],
+    rawData: null,
+  }, catalogIndex));
+  const trainer = {
+    listingId: listing?.id || "",
+    hasControlPin: Boolean(listing?.hasControlPin),
+    nickname: listing?.nickname || "",
+    contact: listing?.contact || "",
+    body: normalizeListingBodyInput(listing?.body),
+    transferWilling: Boolean(listing?.transferWilling),
+    images: getListingUserImages(listing),
+  };
+
+  currentImport = profile;
+  currentTrainer = trainer;
+  currentUserImages = trainer.images;
+  listingsCache = [listing, ...listingsCache.filter((candidate) => candidate.id !== listing.id)];
+
+  saveProfile(currentImport);
+  saveTrainerInfo(currentTrainer);
+  clearGeneratedImage();
+  applyTrainerInfo(currentTrainer);
+  renderPreview(currentImport);
+  renderGroupOptions();
+  renderImagePreview();
+  updatePublishAvailability();
+}
+
+function createAppUiError(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
 }
 
 async function copyTextToClipboard(text) {

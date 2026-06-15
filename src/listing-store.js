@@ -106,6 +106,7 @@ export async function loadListingPage(options = {}) {
     const requiredCandidateCount = getRequiredListingCandidateCount(remoteMeta, requiredCount, candidateLimit);
     let listings = activeCachedListings;
     let source = "cache";
+    let exhausted = false;
 
     if (!remoteMeta) {
       listings = [];
@@ -147,16 +148,22 @@ export async function loadListingPage(options = {}) {
         pageSize: loadPageSize,
       });
 
-      if (nextListings.length === 0) break;
+      if (nextListings.length === 0) {
+        exhausted = true;
+        break;
+      }
 
       listings = sortListingsByCreatedAtDesc(mergeListingChanges(listings, nextListings));
       source = source === "incremental" ? "incremental-page" : "page";
 
-      if (nextListings.length < loadPageSize) break;
+      if (nextListings.length < loadPageSize) {
+        exhausted = true;
+        break;
+      }
     }
 
     saveLocalListings(listings, createListingsSyncState(listings, remoteMeta, syncState));
-    return createListingPageResult(listings, remoteMeta?.activeCount, source, pageIndex, pageSize);
+    return createListingPageResult(listings, remoteMeta?.activeCount, source, pageIndex, pageSize, { exhausted });
   } catch (error) {
     console.warn("Firebase 페이지 목록을 불러오지 못해 로컬 캐시를 사용합니다.", error);
     const listings = sortListingsByCreatedAtDesc(loadLocalListings());
@@ -567,7 +574,14 @@ function getRequiredListingCandidateCount(remoteMeta = null, requiredCount = DEF
   return Math.max(safeRequiredCount, cappedCandidateCount);
 }
 
-function createListingPageResult(listings = [], totalCount = null, source = "unknown", pageIndex = 0, pageSize = DEFAULT_LISTINGS_PAGE_SIZE) {
+function createListingPageResult(
+  listings = [],
+  totalCount = null,
+  source = "unknown",
+  pageIndex = 0,
+  pageSize = DEFAULT_LISTINGS_PAGE_SIZE,
+  options = {},
+) {
   const activeListings = filterActiveListings(listings);
   const normalizedTotalCount = totalCount != null && Number.isFinite(Number(totalCount))
     ? Number(totalCount)
@@ -593,6 +607,7 @@ function createListingPageResult(listings = [], totalCount = null, source = "unk
     hasNextPage: safePageIndex < totalPages - 1,
     hasPreviousPage: safePageIndex > 0,
     hasMore: activeListings.length < displayTotalCount,
+    exhausted: Boolean(options.exhausted),
     source,
   };
 }

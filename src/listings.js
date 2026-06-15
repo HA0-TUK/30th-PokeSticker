@@ -208,11 +208,19 @@ function createProfileSortedPageResult(result = {}, profile = null) {
   const normalizedTotalCount = Number.isFinite(Number(result.totalCount))
     ? Number(result.totalCount)
     : sortedCandidates.length;
-  const totalCount = Math.max(sortedCandidates.length, normalizedTotalCount);
-  const totalPages = Math.max(1, Math.ceil(totalCount / pageSize));
-  const pageIndex = Math.min(Math.max(0, Number(result.pageIndex || 0)), totalPages - 1);
-  const startIndex = pageIndex * pageSize;
-  const listings = sortedCandidates.slice(startIndex, startIndex + pageSize);
+  let totalCount = Math.max(sortedCandidates.length, normalizedTotalCount);
+  let totalPages = Math.max(1, Math.ceil(totalCount / pageSize));
+  let pageIndex = Math.min(Math.max(0, Number(result.pageIndex || 0)), totalPages - 1);
+  let startIndex = pageIndex * pageSize;
+  let listings = sortedCandidates.slice(startIndex, startIndex + pageSize);
+
+  if (result.exhausted && listings.length === 0 && sortedCandidates.length > 0 && pageIndex > 0) {
+    totalCount = sortedCandidates.length;
+    totalPages = Math.max(1, Math.ceil(totalCount / pageSize));
+    pageIndex = Math.min(pageIndex, totalPages - 1);
+    startIndex = pageIndex * pageSize;
+    listings = sortedCandidates.slice(startIndex, startIndex + pageSize);
+  }
 
   return {
     ...result,
