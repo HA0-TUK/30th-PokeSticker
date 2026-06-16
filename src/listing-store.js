@@ -103,9 +103,10 @@ export async function loadListingPage(options = {}) {
     const syncState = loadLocalSyncState();
     const activeCachedListings = sortListingsByCreatedAtDesc(cachedListings);
     let remoteMeta = await loadRemoteListingsMeta(firebase);
+    const cacheCountMismatch = hasListingCountMismatch(activeCachedListings, syncState, remoteMeta);
     const requiredCandidateCount = getRequiredListingCandidateCount(remoteMeta, requiredCount, candidateLimit);
-    let listings = activeCachedListings;
-    let source = "cache";
+    let listings = cacheCountMismatch ? [] : activeCachedListings;
+    let source = cacheCountMismatch ? "page" : "cache";
     let exhausted = false;
 
     if (!remoteMeta) {
@@ -113,11 +114,11 @@ export async function loadListingPage(options = {}) {
       source = "page";
     }
 
-    if (remoteMeta && shouldUseCachedListings(syncState, remoteMeta) && hasEnoughListingsForPage(activeCachedListings, remoteMeta, requiredCandidateCount)) {
+    if (!cacheCountMismatch && remoteMeta && shouldUseCachedListings(syncState, remoteMeta) && hasEnoughListingsForPage(activeCachedListings, remoteMeta, requiredCandidateCount)) {
       return createListingPageResult(activeCachedListings, remoteMeta.activeCount, source, pageIndex, pageSize);
     }
 
-    if (remoteMeta && !shouldUseCachedListings(syncState, remoteMeta) && canLoadIncrementalChanges(syncState) && activeCachedListings.length > 0) {
+    if (!cacheCountMismatch && remoteMeta && !shouldUseCachedListings(syncState, remoteMeta) && canLoadIncrementalChanges(syncState) && activeCachedListings.length > 0) {
       const [changedListings, deletedListings] = await Promise.all([
         loadRemoteListingChanges(firebase, syncState.lastSyncAt),
         loadRemoteDeletedListingChanges(firebase, syncState.lastSyncAt),
@@ -134,7 +135,7 @@ export async function loadListingPage(options = {}) {
       source = "page";
     }
 
-    if (remoteMeta && shouldUseCachedListings(syncState, remoteMeta) && !hasEnoughListingsForPage(listings, remoteMeta, requiredCandidateCount)) {
+    if (!cacheCountMismatch && remoteMeta && shouldUseCachedListings(syncState, remoteMeta) && !hasEnoughListingsForPage(listings, remoteMeta, requiredCandidateCount)) {
       source = "cache-page";
     }
 
@@ -467,8 +468,9 @@ export async function resolveListingShareTarget(listingId, pageSize = DEFAULT_LI
 export async function syncListingsCache(firebase, cachedListings = [], syncState = {}) {
   const activeCachedListings = filterActiveListings(cachedListings);
   const remoteMeta = await loadRemoteListingsMeta(firebase);
+  const cacheCountMismatch = hasListingCountMismatch(activeCachedListings, syncState, remoteMeta);
 
-  if (remoteMeta && shouldUseCachedListings(syncState, remoteMeta)) {
+  if (!cacheCountMismatch && remoteMeta && shouldUseCachedListings(syncState, remoteMeta)) {
     return {
       listings: activeCachedListings,
       syncState,
@@ -477,7 +479,7 @@ export async function syncListingsCache(firebase, cachedListings = [], syncState
     };
   }
 
-  if (remoteMeta && canLoadIncrementalChanges(syncState)) {
+  if (!cacheCountMismatch && remoteMeta && canLoadIncrementalChanges(syncState)) {
     const [changedListings, deletedListings] = await Promise.all([
       loadRemoteListingChanges(firebase, syncState.lastSyncAt),
       loadRemoteDeletedListingChanges(firebase, syncState.lastSyncAt),
@@ -500,7 +502,15 @@ export async function syncListingsCache(firebase, cachedListings = [], syncState
     };
   }
 
-  const listings = await loadAllRemoteListings(firebase);
+  const listings = remoteMeta
+    ? await loadRemoteListingPage(firebase, {
+      pageSize: getRequiredListingCandidateCount(
+        remoteMeta,
+        DEFAULT_LISTINGS_PAGE_SIZE,
+        DEFAULT_LISTING_SORT_CANDIDATE_LIMIT,
+      ),
+    })
+    : await loadAllRemoteListings(firebase);
 
   return {
     listings,
@@ -514,8 +524,32 @@ export function shouldUseCachedListings(syncState = {}, remoteMeta = null) {
     syncState.initialized
       && syncState.cacheVersion === SYNC_CACHE_VERSION
       && remoteMeta
-      && Number(syncState.revision || 0) === Number(remoteMeta.revision || 0),
+      && Number(syncState.revision || 0) === Number(remoteMeta.revision || 0)
+      && !hasSyncActiveCountMismatch(syncState, remoteMeta),
   );
+}
+
+function hasListingCountMismatch(listings = [], syncState = {}, remoteMeta = null) {
+  return hasCachedListingOverflow(listings, remoteMeta) || hasSyncActiveCountMismatch(syncState, remoteMeta);
+}
+
+function hasCachedListingOverflow(listings = [], remoteMeta = null) {
+  const activeCount = getRemoteActiveCount(remoteMeta);
+  if (activeCount == null) return false;
+  return filterActiveListings(listings).length > activeCount;
+}
+
+function hasSyncActiveCountMismatch(syncState = {}, remoteMeta = null) {
+  const activeCount = getRemoteActiveCount(remoteMeta);
+  if (activeCount == null || !syncState.initialized || syncState.cacheVersion !== SYNC_CACHE_VERSION) return false;
+
+  const syncActiveCount = Number(syncState.activeCount);
+  return !Number.isFinite(syncActiveCount) || Math.floor(syncActiveCount) !== activeCount;
+}
+
+function getRemoteActiveCount(remoteMeta = null) {
+  if (remoteMeta?.activeCount == null || !Number.isFinite(Number(remoteMeta.activeCount))) return null;
+  return Math.max(0, Math.floor(Number(remoteMeta.activeCount)));
 }
 
 export function mergeListingChanges(cachedListings = [], changedListings = [], deletedListings = []) {
@@ -584,13 +618,14 @@ function createListingPageResult(
 ) {
   const activeListings = filterActiveListings(listings);
   const normalizedTotalCount = totalCount != null && Number.isFinite(Number(totalCount))
-    ? Number(totalCount)
+    ? Math.max(0, Math.floor(Number(totalCount)))
     : activeListings.length;
-  const displayTotalCount = Math.max(activeListings.length, normalizedTotalCount);
+  const displayTotalCount = normalizedTotalCount;
   const totalPages = Math.max(1, Math.ceil(displayTotalCount / pageSize));
   const safePageIndex = Math.min(Math.max(0, pageIndex), totalPages - 1);
   const startIndex = safePageIndex * pageSize;
-  const pageListings = activeListings.slice(startIndex, startIndex + pageSize);
+  const endIndex = Math.min(startIndex + pageSize, displayTotalCount);
+  const pageListings = activeListings.slice(startIndex, endIndex);
 
   return {
     listings: pageListings,

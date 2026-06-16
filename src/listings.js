@@ -205,28 +205,32 @@ function createProfileSortedPageResult(result = {}, profile = null) {
   const pageSize = Number.isFinite(Number(result.pageSize)) && Number(result.pageSize) > 0
     ? Math.floor(Number(result.pageSize))
     : DEFAULT_LISTINGS_PAGE_SIZE;
-  const normalizedTotalCount = Number.isFinite(Number(result.totalCount))
-    ? Number(result.totalCount)
+  const hasAuthoritativeTotal = Number.isFinite(Number(result.totalCount));
+  const normalizedTotalCount = hasAuthoritativeTotal
+    ? Math.max(0, Math.floor(Number(result.totalCount)))
     : sortedCandidates.length;
-  let totalCount = Math.max(sortedCandidates.length, normalizedTotalCount);
+  let totalCount = normalizedTotalCount;
+  let pageCandidates = hasAuthoritativeTotal && sortedCandidates.length > totalCount
+    ? sortedCandidates.slice(0, totalCount)
+    : sortedCandidates;
   let totalPages = Math.max(1, Math.ceil(totalCount / pageSize));
   let pageIndex = Math.min(Math.max(0, Number(result.pageIndex || 0)), totalPages - 1);
   let startIndex = pageIndex * pageSize;
-  let listings = sortedCandidates.slice(startIndex, startIndex + pageSize);
+  let listings = pageCandidates.slice(startIndex, Math.min(startIndex + pageSize, totalCount));
 
-  if (result.exhausted && listings.length === 0 && sortedCandidates.length > 0 && pageIndex > 0) {
-    totalCount = sortedCandidates.length;
+  if (result.exhausted && listings.length === 0 && pageCandidates.length > 0 && pageIndex > 0) {
+    totalCount = pageCandidates.length;
     totalPages = Math.max(1, Math.ceil(totalCount / pageSize));
     pageIndex = Math.min(pageIndex, totalPages - 1);
     startIndex = pageIndex * pageSize;
-    listings = sortedCandidates.slice(startIndex, startIndex + pageSize);
+    listings = pageCandidates.slice(startIndex, startIndex + pageSize);
   }
 
   return {
     ...result,
     listings,
-    candidates: sortedCandidates,
-    candidateCount: sortedCandidates.length,
+    candidates: pageCandidates,
+    candidateCount: pageCandidates.length,
     loadedCount: listings.length,
     pageIndex,
     pageSize,
@@ -236,7 +240,7 @@ function createProfileSortedPageResult(result = {}, profile = null) {
     totalPages,
     hasNextPage: pageIndex < totalPages - 1,
     hasPreviousPage: pageIndex > 0,
-    hasMore: sortedCandidates.length < totalCount,
+    hasMore: pageCandidates.length < totalCount,
   };
 }
 
