@@ -24,6 +24,7 @@ import {
   LISTINGS_BROADCAST_CHANNEL,
   LISTINGS_REFRESH_KEY,
   loadCachedListings,
+  loadListingSummariesByIds,
   loadListingWithDetails,
   loadListingPage as loadStoredListingPage,
   resolveListingShareTarget,
@@ -183,7 +184,15 @@ async function renderListings(pageIndex = paginationState.pageIndex || 0, option
     createProfileSortedPageResult(result, currentProfile),
     options.focusListingId,
   );
-  const listings = sortedResult.listings;
+  const listings = sortedResult.needsSummaryHydration
+    ? await loadListingSummariesByIds(sortedResult.listings.map((listing) => listing.id))
+    : sortedResult.listings;
+  const renderResult = {
+    ...sortedResult,
+    listings,
+    loadedCount: listings.length,
+    endItem: listings.length > 0 ? sortedResult.startItem + listings.length - 1 : 0,
+  };
   if (canReuseRenderedListingCards(listings, options)) {
     rememberRenderedListings(listings);
   } else {
@@ -192,7 +201,7 @@ async function renderListings(pageIndex = paginationState.pageIndex || 0, option
       preserveGeneratedSheetObjectUrls: true,
     });
   }
-  renderPagination(sortedResult);
+  renderPagination(renderResult);
 
   if (options.focusListingId) {
     requestAnimationFrame(() => scrollToListingCard(options.focusListingId));

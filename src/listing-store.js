@@ -19,12 +19,14 @@ import {
 const FIREBASE_SDK_VERSION = "12.7.0";
 const LISTINGS_KEY = "pokemon-market-listings";
 const LISTINGS_SYNC_KEY = "pokemon-market-listings-sync";
+const LISTING_MATCH_INDEX_KEY = "pokemon-market-listing-match-index";
 const FIREBASE_UID_KEY = "pokemon-market-firebase-uid";
 const LISTING_CONTROL_GRANTS_KEY = "pokemon-market-listing-control-grants";
 export const LISTINGS_REFRESH_KEY = "pokemon-market-listings-refresh";
 export const LISTINGS_BROADCAST_CHANNEL = "pokemon-market-listings";
 const LISTINGS_COLLECTION = "listings";
 const LISTING_DETAILS_COLLECTION = "listingDetails";
+const LISTING_MATCH_INDEX_COLLECTION = "listingMatchIndex";
 const DELETED_LISTINGS_COLLECTION = "deletedListings";
 const LISTING_SECRETS_COLLECTION = "listingSecrets";
 const LISTING_CONTROL_GRANTS_COLLECTION = "listingControlGrants";
@@ -33,6 +35,8 @@ const META_COLLECTION = "meta";
 const LISTINGS_META_DOCUMENT = "listings";
 const IMAGE_FOLDER = "listing-images";
 const SYNC_CACHE_VERSION = 5;
+const MATCH_INDEX_SCHEMA_VERSION = 1;
+const MATCH_INDEX_SHARD_COUNT = 16;
 const INCREMENTAL_SYNC_MAX_AGE_DAYS = 25;
 export const DEFAULT_LISTINGS_PAGE_SIZE = 10;
 export const DEFAULT_LISTING_SORT_CANDIDATE_LIMIT = 200;
@@ -75,6 +79,7 @@ export function clearListingCache() {
   try {
     localStorage.removeItem(LISTINGS_KEY);
     localStorage.removeItem(LISTINGS_SYNC_KEY);
+    localStorage.removeItem(LISTING_MATCH_INDEX_KEY);
   } catch {
     // Blocked storage should not prevent importing a new profile list.
   }
@@ -103,6 +108,18 @@ export async function loadListingPage(options = {}) {
     const syncState = loadLocalSyncState();
     const activeCachedListings = sortListingsByCreatedAtDesc(cachedListings);
     let remoteMeta = await loadRemoteListingsMeta(firebase);
+    const matchIndex = await loadMatchIndexCandidates(firebase, remoteMeta);
+
+    if (matchIndex) {
+      return {
+        ...createListingPageResult(matchIndex.entries, remoteMeta?.activeCount, matchIndex.source, pageIndex, pageSize, {
+          indexOnly: true,
+        }),
+        needsSummaryHydration: true,
+        matchIndexRevision: matchIndex.revision,
+      };
+    }
+
     const cacheCountMismatch = hasListingCountMismatch(activeCachedListings, syncState, remoteMeta);
     const requiredCandidateCount = getRequiredListingCandidateCount(remoteMeta, requiredCount, candidateLimit);
     let listings = cacheCountMismatch ? [] : activeCachedListings;
@@ -223,6 +240,36 @@ export async function loadListingWithDetails(listingOrId) {
 
   const detail = await loadRemoteListingDetail(firebase, listingId);
   return mergeListingDetail(baseListing, detail);
+}
+
+export async function loadListingSummariesByIds(listingIds = []) {
+  const ids = [...new Set((listingIds || []).map(normalizeListingId).filter(Boolean))];
+  if (ids.length === 0) return [];
+
+  const localListings = loadLocalListings();
+  const localById = new Map(localListings.map((listing) => [listing.id, listing]));
+  const firebase = await getFirebaseReadState();
+
+  if (!firebase) {
+    return ids.map((id) => localById.get(id)).filter(Boolean);
+  }
+
+  const summaries = await Promise.all(ids.map(async (id) => {
+    try {
+      return await loadRemoteListingById(firebase, id);
+    } catch {
+      return localById.get(id) || null;
+    }
+  }));
+  const validSummaries = summaries.filter(Boolean);
+
+  if (validSummaries.length > 0) {
+    const mergedListings = mergeListingChanges(localListings, validSummaries);
+    saveLocalListings(mergedListings, loadLocalSyncState());
+  }
+
+  const byId = new Map(validSummaries.map((listing) => [listing.id, listing]));
+  return ids.map((id) => byId.get(id) || localById.get(id)).filter(Boolean);
 }
 
 export function isValidControlPin(pin) {
@@ -552,6 +599,256 @@ function getRemoteActiveCount(remoteMeta = null) {
   return Math.max(0, Math.floor(Number(remoteMeta.activeCount)));
 }
 
+async function loadMatchIndexCandidates(firebase, remoteMeta = null) {
+  if (!hasUsableMatchIndexMeta(remoteMeta)) return null;
+
+  const localIndex = loadLocalMatchIndex();
+  if (shouldUseLocalMatchIndex(localIndex, remoteMeta)) {
+    return {
+      entries: localIndex.entries,
+      revision: localIndex.revision,
+      source: "match-index-cache",
+    };
+  }
+
+  const entries = await loadRemoteMatchIndexEntries(firebase, remoteMeta);
+  if (!hasCompleteMatchIndexEntries(entries, remoteMeta)) return null;
+
+  const nextIndex = {
+    schemaVersion: MATCH_INDEX_SCHEMA_VERSION,
+    revision: getRemoteMatchIndexRevision(remoteMeta),
+    shardCount: getRemoteMatchIndexShardCount(remoteMeta),
+    updatedAt: normalizeOptionalDateValue(remoteMeta?.matchIndexUpdatedAt),
+    entries,
+  };
+  saveLocalMatchIndex(nextIndex);
+
+  return {
+    entries,
+    revision: nextIndex.revision,
+    source: "match-index",
+  };
+}
+
+function hasUsableMatchIndexMeta(remoteMeta = null) {
+  return getRemoteMatchIndexRevision(remoteMeta) > 0 && getRemoteMatchIndexShardCount(remoteMeta) > 0;
+}
+
+function shouldUseLocalMatchIndex(localIndex = null, remoteMeta = null) {
+  return Boolean(
+    localIndex
+      && localIndex.schemaVersion === MATCH_INDEX_SCHEMA_VERSION
+      && localIndex.revision === getRemoteMatchIndexRevision(remoteMeta)
+      && localIndex.shardCount === getRemoteMatchIndexShardCount(remoteMeta)
+      && hasCompleteMatchIndexEntries(localIndex.entries, remoteMeta),
+  );
+}
+
+function hasCompleteMatchIndexEntries(entries = [], remoteMeta = null) {
+  const activeCount = getRemoteActiveCount(remoteMeta);
+  if (activeCount == null) return true;
+  return entries.length >= activeCount;
+}
+
+async function loadRemoteMatchIndexEntries(firebase, remoteMeta = null) {
+  const shardCount = getRemoteMatchIndexShardCount(remoteMeta);
+  const snapshots = await Promise.all(Array.from({ length: shardCount }, (_, index) =>
+    firebase.getDoc(firebase.doc(firebase.db, LISTING_MATCH_INDEX_COLLECTION, formatMatchIndexShardId(index))),
+  ));
+  const entries = [];
+
+  for (const snapshot of snapshots) {
+    if (!snapshot.exists()) continue;
+    const data = snapshot.data();
+    if (Number(data?.schemaVersion || 0) !== MATCH_INDEX_SCHEMA_VERSION) continue;
+    for (const [id, entry] of Object.entries(data?.entries || {})) {
+      const normalizedEntry = normalizeMatchIndexEntry(id, entry);
+      if (normalizedEntry) entries.push(normalizedEntry);
+    }
+  }
+
+  return sortListingsByCreatedAtDesc(entries);
+}
+
+function loadLocalMatchIndex() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(LISTING_MATCH_INDEX_KEY) || "null");
+    if (!parsed || typeof parsed !== "object") return null;
+    const entries = (Array.isArray(parsed.entries) ? parsed.entries : [])
+      .map((entry) => normalizeMatchIndexEntry(entry?.id, entry))
+      .filter(Boolean);
+
+    return {
+      schemaVersion: Number(parsed.schemaVersion || 0),
+      revision: Number(parsed.revision || 0),
+      shardCount: Number(parsed.shardCount || 0),
+      updatedAt: normalizeOptionalDateValue(parsed.updatedAt),
+      entries,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function saveLocalMatchIndex(index) {
+  try {
+    localStorage.setItem(LISTING_MATCH_INDEX_KEY, JSON.stringify({
+      schemaVersion: MATCH_INDEX_SCHEMA_VERSION,
+      revision: Number(index?.revision || 0),
+      shardCount: Number(index?.shardCount || 0),
+      updatedAt: normalizeOptionalDateValue(index?.updatedAt),
+      entries: (index?.entries || []).map(compactMatchIndexEntry).filter(Boolean),
+    }));
+  } catch {
+    // Match index cache is an optimization; failing to write it should not break listings.
+  }
+}
+
+function compactMatchIndexEntry(entry = {}) {
+  const normalizedEntry = normalizeMatchIndexEntry(entry.id, entry);
+  if (!normalizedEntry) return null;
+  return {
+    id: normalizedEntry.id,
+    createdAt: normalizedEntry.createdAt,
+    updatedAt: normalizedEntry.updatedAt,
+    transferWilling: Boolean(normalizedEntry.transferWilling),
+    wantedIds: normalizeStringArray(normalizedEntry.wantedIds),
+    ownedIds: normalizeStringArray(normalizedEntry.ownedIds),
+  };
+}
+
+function normalizeMatchIndexEntry(id, entry = {}) {
+  const listingId = normalizeListingId(entry?.id || id);
+  if (!listingId) return null;
+  const wantedIds = normalizeStringArray(entry?.wantedIds || collectGroupKeys(entry?.wantedGroups || []));
+  const ownedIds = normalizeStringArray(entry?.ownedIds || collectGroupKeys(entry?.ownedGroups || []));
+
+  return {
+    id: listingId,
+    createdAt: normalizeOptionalDateValue(entry?.createdAt),
+    updatedAt: normalizeOptionalDateValue(entry?.updatedAt),
+    transferWilling: Boolean(entry?.transferWilling),
+    wantedIds,
+    ownedIds,
+    wantedGroups: createMatchIndexGroups(wantedIds, "wanted"),
+    ownedGroups: createMatchIndexGroups(ownedIds, "owned"),
+  };
+}
+
+function createMatchIndexGroups(ids = [], category = "") {
+  return [{
+    id: `${category || "items"}-match-index`,
+    label: "",
+    subtitle: "",
+    items: normalizeStringArray(ids).map((catalogId) => ({
+      catalogId,
+      key: catalogId,
+      normalizedKey: catalogId,
+      rawKey: catalogId,
+      category,
+    })),
+  }];
+}
+
+function normalizeStringArray(values = []) {
+  return [...new Set((Array.isArray(values) ? values : [])
+    .map((value) => String(value ?? "").trim())
+    .filter(Boolean))];
+}
+
+function createMatchIndexEntryFromListing(listing = {}) {
+  const normalizedListing = normalizeListingCatalogFields(listing);
+  return compactMatchIndexEntry({
+    id: normalizedListing.id,
+    createdAt: normalizedListing.createdAt,
+    updatedAt: normalizedListing.updatedAt,
+    transferWilling: Boolean(normalizedListing.transferWilling),
+    wantedIds: normalizeStringArray(normalizedListing.wantedIds || collectGroupKeys(normalizedListing.wantedGroups)),
+    ownedIds: normalizeStringArray(normalizedListing.ownedIds || collectGroupKeys(normalizedListing.ownedGroups)),
+  });
+}
+
+function createMatchIndexShardUpsert(listing = {}, revision = 0, updatedAt = "") {
+  const entry = createMatchIndexEntryFromListing(listing);
+  if (!entry) return null;
+
+  return {
+    schemaVersion: MATCH_INDEX_SCHEMA_VERSION,
+    revision: Number(revision || 0),
+    updatedAt,
+    entries: {
+      [entry.id]: entry,
+    },
+  };
+}
+
+function createMatchIndexShardDelete(firebase, listingId, revision = 0, updatedAt = "") {
+  return {
+    schemaVersion: MATCH_INDEX_SCHEMA_VERSION,
+    revision: Number(revision || 0),
+    updatedAt,
+    entries: {
+      [listingId]: firebase.deleteField(),
+    },
+  };
+}
+
+function createEmptyMatchIndexShard(revision = 0, updatedAt = "") {
+  return {
+    schemaVersion: MATCH_INDEX_SCHEMA_VERSION,
+    revision: Number(revision || 0),
+    updatedAt,
+    entries: {},
+  };
+}
+
+function createMatchIndexMetaPatch(revision = null, updatedAt = "", firebase = null) {
+  const normalizedRevision = Number(revision);
+  return {
+    matchIndexRevision: Number.isFinite(normalizedRevision) && normalizedRevision > 0
+      ? Math.floor(normalizedRevision)
+      : firebase?.increment
+        ? firebase.increment(1)
+        : 1,
+    matchIndexShardCount: MATCH_INDEX_SHARD_COUNT,
+    matchIndexUpdatedAt: updatedAt,
+  };
+}
+
+function getMatchIndexShardRef(firebase, listingId) {
+  return firebase.doc(
+    firebase.db,
+    LISTING_MATCH_INDEX_COLLECTION,
+    formatMatchIndexShardId(getMatchIndexShardIndex(listingId)),
+  );
+}
+
+function getMatchIndexShardIndex(value) {
+  const text = String(value ?? "");
+  let hash = 2166136261;
+
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+
+  return (hash >>> 0) % MATCH_INDEX_SHARD_COUNT;
+}
+
+function formatMatchIndexShardId(index) {
+  return String(Math.max(0, Math.floor(Number(index) || 0))).padStart(2, "0");
+}
+
+function getRemoteMatchIndexRevision(remoteMeta = null) {
+  const revision = Number(remoteMeta?.matchIndexRevision || 0);
+  return Number.isFinite(revision) && revision > 0 ? Math.floor(revision) : 0;
+}
+
+function getRemoteMatchIndexShardCount(remoteMeta = null) {
+  const shardCount = Number(remoteMeta?.matchIndexShardCount || 0);
+  return Number.isFinite(shardCount) && shardCount > 0 ? Math.floor(shardCount) : 0;
+}
+
 export function mergeListingChanges(cachedListings = [], changedListings = [], deletedListings = []) {
   const byId = new Map();
 
@@ -643,6 +940,7 @@ function createListingPageResult(
     hasPreviousPage: safePageIndex > 0,
     hasMore: activeListings.length < displayTotalCount,
     exhausted: Boolean(options.exhausted),
+    needsSummaryHydration: Boolean(options.indexOnly),
     source,
   };
 }
@@ -777,6 +1075,7 @@ export async function savePersonalListing(draftListing, formData, options = {}) 
     secret,
     grantRef,
     grant,
+    matchIndexListing: listing,
   });
   await refreshRemoteListingsCount(firebase, nextRevision);
   await deleteStoragePaths(firebase, obsoleteStoragePaths);
@@ -1072,7 +1371,7 @@ async function initializeFirebaseState() {
   ] = await Promise.all([
     import(`https://www.gstatic.com/firebasejs/${FIREBASE_SDK_VERSION}/firebase-app.js`),
     import(`https://www.gstatic.com/firebasejs/${FIREBASE_SDK_VERSION}/firebase-auth.js`),
-    import(`https://www.gstatic.com/firebasejs/${FIREBASE_SDK_VERSION}/firebase-firestore-lite.js`),
+    import(`https://www.gstatic.com/firebasejs/${FIREBASE_SDK_VERSION}/firebase-firestore.js`),
     import(`https://www.gstatic.com/firebasejs/${FIREBASE_SDK_VERSION}/firebase-storage.js`),
   ]);
 
@@ -1103,6 +1402,7 @@ async function initializeFirebaseState() {
     db,
     storage,
     collection: firestoreModule.collection,
+    deleteField: firestoreModule.deleteField,
     deleteDoc: firestoreModule.deleteDoc,
     doc: firestoreModule.doc,
     increment: firestoreModule.increment,
@@ -1392,11 +1692,6 @@ async function loadRemoteListingsCount(firebase) {
     return Number.isFinite(count) ? count : 0;
   }
 
-  const remoteMeta = await loadRemoteListingsMeta(firebase);
-  if (remoteMeta?.activeCount != null && Number.isFinite(Number(remoteMeta.activeCount))) {
-    return Number(remoteMeta.activeCount);
-  }
-
   return null;
 }
 
@@ -1443,20 +1738,27 @@ async function writeListingAndMeta(firebase, listingRef, listing, updatedAt, opt
     secret = null,
     grantRef = null,
     grant = null,
+    matchIndexListing = null,
   } = options;
+  const matchIndexRef = matchIndexListing?.id ? getMatchIndexShardRef(firebase, matchIndexListing.id) : null;
 
   if (firebase.runTransaction) {
     return firebase.runTransaction(firebase.db, async (transaction) => {
       const metaSnapshot = await transaction.get(metaRef);
       const nextRevision = getNextRevision(metaSnapshot);
+      const matchIndexPatch = matchIndexRef
+        ? createMatchIndexShardUpsert(matchIndexListing, nextRevision, updatedAt)
+        : null;
 
       transaction.set(listingRef, listing);
       if (detailRef && detail) transaction.set(detailRef, detail);
       if (secretRef && secret) transaction.set(secretRef, secret, { merge: true });
       if (grantRef && grant) transaction.set(grantRef, grant, { merge: true });
+      if (matchIndexRef && matchIndexPatch) transaction.set(matchIndexRef, matchIndexPatch, { merge: true });
       transaction.set(metaRef, {
         revision: nextRevision,
         updatedAt,
+        ...(matchIndexPatch ? createMatchIndexMetaPatch(nextRevision, updatedAt, firebase) : {}),
       }, { merge: true });
 
       return nextRevision;
@@ -1466,14 +1768,19 @@ async function writeListingAndMeta(firebase, listingRef, listing, updatedAt, opt
   const metaPatch = {
     revision: firebase.increment(1),
     updatedAt,
+    ...(matchIndexRef ? createMatchIndexMetaPatch(null, updatedAt, firebase) : {}),
   };
 
   if (firebase.writeBatch) {
+    const matchIndexPatch = matchIndexRef
+      ? createMatchIndexShardUpsert(matchIndexListing, null, updatedAt)
+      : null;
     const batch = firebase.writeBatch(firebase.db);
     batch.set(listingRef, listing);
     if (detailRef && detail) batch.set(detailRef, detail);
     if (secretRef && secret) batch.set(secretRef, secret, { merge: true });
     if (grantRef && grant) batch.set(grantRef, grant, { merge: true });
+    if (matchIndexRef && matchIndexPatch) batch.set(matchIndexRef, matchIndexPatch, { merge: true });
     batch.set(metaRef, metaPatch, { merge: true });
     await batch.commit();
     return null;
@@ -1483,24 +1790,38 @@ async function writeListingAndMeta(firebase, listingRef, listing, updatedAt, opt
   if (detailRef && detail) await firebase.setDoc(detailRef, detail);
   if (secretRef && secret) await firebase.setDoc(secretRef, secret, { merge: true });
   if (grantRef && grant) await firebase.setDoc(grantRef, grant, { merge: true });
+  if (matchIndexRef) {
+    const matchIndexPatch = createMatchIndexShardUpsert(matchIndexListing, null, updatedAt);
+    if (matchIndexPatch) await firebase.setDoc(matchIndexRef, matchIndexPatch, { merge: true });
+  }
   await firebase.setDoc(metaRef, metaPatch, { merge: true });
   return null;
 }
 
 async function writeListingDeletionAndMeta(firebase, listingRef, detailRef, deletionRef, deletion, updatedAt) {
   const metaRef = firebase.doc(firebase.db, META_COLLECTION, LISTINGS_META_DOCUMENT);
+  const listingId = normalizeListingId(deletion?.listingId);
+  const matchIndexRef = listingId ? getMatchIndexShardRef(firebase, listingId) : null;
 
   if (firebase.runTransaction) {
     return firebase.runTransaction(firebase.db, async (transaction) => {
       const metaSnapshot = await transaction.get(metaRef);
+      const matchIndexSnapshot = matchIndexRef ? await transaction.get(matchIndexRef) : null;
       const nextRevision = getNextRevision(metaSnapshot);
+      const matchIndexPatch = matchIndexRef
+        ? matchIndexSnapshot?.exists()
+          ? createMatchIndexShardDelete(firebase, listingId, nextRevision, updatedAt)
+          : createEmptyMatchIndexShard(nextRevision, updatedAt)
+        : null;
 
       transaction.delete(listingRef);
       if (detailRef) transaction.delete(detailRef);
       transaction.set(deletionRef, deletion, { merge: true });
+      if (matchIndexRef && matchIndexPatch) transaction.set(matchIndexRef, matchIndexPatch, { merge: true });
       transaction.set(metaRef, {
         revision: nextRevision,
         updatedAt,
+        ...(matchIndexPatch ? createMatchIndexMetaPatch(nextRevision, updatedAt, firebase) : {}),
       }, { merge: true });
 
       return nextRevision;
@@ -1511,11 +1832,16 @@ async function writeListingDeletionAndMeta(firebase, listingRef, detailRef, dele
     const metaPatch = {
       revision: firebase.increment(1),
       updatedAt,
+      ...(matchIndexRef ? createMatchIndexMetaPatch(null, updatedAt, firebase) : {}),
     };
+    const matchIndexPatch = matchIndexRef
+      ? createMatchIndexShardDelete(firebase, listingId, null, updatedAt)
+      : null;
     const batch = firebase.writeBatch(firebase.db);
     batch.delete(listingRef);
     if (detailRef) batch.delete(detailRef);
     batch.set(deletionRef, deletion, { merge: true });
+    if (matchIndexRef && matchIndexPatch) batch.set(matchIndexRef, matchIndexPatch, { merge: true });
     batch.set(metaRef, metaPatch, { merge: true });
     await batch.commit();
     return null;
@@ -1524,9 +1850,17 @@ async function writeListingDeletionAndMeta(firebase, listingRef, detailRef, dele
   await firebase.deleteDoc(listingRef);
   if (detailRef) await firebase.deleteDoc(detailRef);
   await firebase.setDoc(deletionRef, deletion, { merge: true });
+  if (matchIndexRef) {
+    await firebase.setDoc(
+      matchIndexRef,
+      createMatchIndexShardDelete(firebase, listingId, null, updatedAt),
+      { merge: true },
+    );
+  }
   await firebase.setDoc(metaRef, {
     revision: firebase.increment(1),
     updatedAt,
+    ...(matchIndexRef ? createMatchIndexMetaPatch(null, updatedAt, firebase) : {}),
   }, { merge: true });
   return null;
 }
@@ -1557,6 +1891,9 @@ function normalizeRemoteListingsMeta(data) {
     revision: Number(data?.revision || 0),
     updatedAt: normalizeOptionalDateValue(data?.updatedAt),
     activeCount: data?.activeCount != null && Number.isFinite(Number(data.activeCount)) ? Number(data.activeCount) : null,
+    matchIndexRevision: data?.matchIndexRevision != null && Number.isFinite(Number(data.matchIndexRevision)) ? Number(data.matchIndexRevision) : 0,
+    matchIndexShardCount: data?.matchIndexShardCount != null && Number.isFinite(Number(data.matchIndexShardCount)) ? Number(data.matchIndexShardCount) : 0,
+    matchIndexUpdatedAt: normalizeOptionalDateValue(data?.matchIndexUpdatedAt),
   };
 }
 
