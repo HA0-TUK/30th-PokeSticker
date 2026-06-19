@@ -85,6 +85,34 @@ export function clearListingCache() {
   }
 }
 
+export async function hasRemoteListingsChanged(state = {}) {
+  const firebase = await getFirebaseReadState();
+  if (!firebase) return true;
+
+  try {
+    const remoteMeta = await loadRemoteListingsMeta(firebase);
+    if (!remoteMeta) return false;
+    return !isListingsStateCurrent(state, remoteMeta);
+  } catch (error) {
+    console.warn("Firebase listings meta check failed.", error);
+    return true;
+  }
+}
+
+function isListingsStateCurrent(state = {}, remoteMeta = null) {
+  if (!remoteMeta) return false;
+  const stateRevision = Number(state.revision || 0);
+  const stateMatchIndexRevision = Number(state.matchIndexRevision || 0);
+  const stateActiveCount = state.activeCount != null && Number.isFinite(Number(state.activeCount))
+    ? Math.max(0, Math.floor(Number(state.activeCount)))
+    : null;
+  const remoteActiveCount = getRemoteActiveCount(remoteMeta);
+
+  return stateRevision === Number(remoteMeta.revision || 0)
+    && stateMatchIndexRevision === getRemoteMatchIndexRevision(remoteMeta)
+    && (remoteActiveCount == null || stateActiveCount === remoteActiveCount);
+}
+
 export async function loadListingPage(options = {}) {
   const pageSize = Number.isFinite(Number(options.pageSize)) && Number(options.pageSize) > 0
     ? Number(options.pageSize)
@@ -107,17 +135,17 @@ export async function loadListingPage(options = {}) {
     const cachedListings = loadLocalListings();
     const syncState = loadLocalSyncState();
     const activeCachedListings = sortListingsByCreatedAtDesc(cachedListings);
-    let remoteMeta = await loadRemoteListingsMeta(firebase);
+    const remoteMeta = await loadRemoteListingsMeta(firebase);
     const matchIndex = await loadMatchIndexCandidates(firebase, remoteMeta);
 
     if (matchIndex) {
-      return {
+      return attachListingsMetaResult({
         ...createListingPageResult(matchIndex.entries, remoteMeta?.activeCount, matchIndex.source, pageIndex, pageSize, {
           indexOnly: true,
         }),
         needsSummaryHydration: true,
         matchIndexRevision: matchIndex.revision,
-      };
+      }, remoteMeta);
     }
 
     const cacheCountMismatch = hasListingCountMismatch(activeCachedListings, syncState, remoteMeta);
@@ -132,7 +160,10 @@ export async function loadListingPage(options = {}) {
     }
 
     if (!cacheCountMismatch && remoteMeta && shouldUseCachedListings(syncState, remoteMeta) && hasEnoughListingsForPage(activeCachedListings, remoteMeta, requiredCandidateCount)) {
-      return createListingPageResult(activeCachedListings, remoteMeta.activeCount, source, pageIndex, pageSize);
+      return attachListingsMetaResult(
+        createListingPageResult(activeCachedListings, remoteMeta.activeCount, source, pageIndex, pageSize),
+        remoteMeta,
+      );
     }
 
     if (!cacheCountMismatch && remoteMeta && !shouldUseCachedListings(syncState, remoteMeta) && canLoadIncrementalChanges(syncState) && activeCachedListings.length > 0) {
@@ -145,7 +176,10 @@ export async function loadListingPage(options = {}) {
       source = "incremental";
 
       if (hasEnoughListingsForPage(listings, remoteMeta, requiredCandidateCount)) {
-        return createListingPageResult(listings, remoteMeta.activeCount, source, pageIndex, pageSize);
+        return attachListingsMetaResult(
+          createListingPageResult(listings, remoteMeta.activeCount, source, pageIndex, pageSize),
+          remoteMeta,
+        );
       }
     } else if (remoteMeta && !shouldUseCachedListings(syncState, remoteMeta) && !canLoadIncrementalChanges(syncState)) {
       listings = [];
@@ -181,7 +215,10 @@ export async function loadListingPage(options = {}) {
     }
 
     saveLocalListings(listings, createListingsSyncState(listings, remoteMeta, syncState));
-    return createListingPageResult(listings, remoteMeta?.activeCount, source, pageIndex, pageSize, { exhausted });
+    return attachListingsMetaResult(
+      createListingPageResult(listings, remoteMeta?.activeCount, source, pageIndex, pageSize, { exhausted }),
+      remoteMeta,
+    );
   } catch (error) {
     console.warn("Firebase 페이지 목록을 불러오지 못해 로컬 캐시를 사용합니다.", error);
     const listings = sortListingsByCreatedAtDesc(loadLocalListings());
@@ -242,19 +279,33 @@ export async function loadListingWithDetails(listingOrId) {
   return mergeListingDetail(baseListing, detail);
 }
 
-export async function loadListingSummariesByIds(listingIds = []) {
+export async function loadListingSummariesByIds(listingIds = [], options = {}) {
   const ids = [...new Set((listingIds || []).map(normalizeListingId).filter(Boolean))];
   if (ids.length === 0) return [];
 
   const localListings = loadLocalListings();
   const localById = new Map(localListings.map((listing) => [listing.id, listing]));
+  const expectedById = createExpectedListingMap(options.expectedListings || options.indexEntries || []);
   const firebase = await getFirebaseReadState();
 
   if (!firebase) {
     return ids.map((id) => localById.get(id)).filter(Boolean);
   }
 
-  const summaries = await Promise.all(ids.map(async (id) => {
+  const cachedSummaries = new Map();
+  const idsToLoad = [];
+
+  for (const id of ids) {
+    const localListing = localById.get(id);
+    const expectedListing = expectedById.get(id);
+    if (isLocalListingSummaryFresh(localListing, expectedListing)) {
+      cachedSummaries.set(id, localListing);
+    } else {
+      idsToLoad.push(id);
+    }
+  }
+
+  const summaries = await Promise.all(idsToLoad.map(async (id) => {
     try {
       return await loadRemoteListingById(firebase, id);
     } catch {
@@ -269,7 +320,28 @@ export async function loadListingSummariesByIds(listingIds = []) {
   }
 
   const byId = new Map(validSummaries.map((listing) => [listing.id, listing]));
-  return ids.map((id) => byId.get(id) || localById.get(id)).filter(Boolean);
+  return ids.map((id) => byId.get(id) || cachedSummaries.get(id) || localById.get(id)).filter(Boolean);
+}
+
+function createExpectedListingMap(listings = []) {
+  const byId = new Map();
+  for (const listing of listings || []) {
+    const id = normalizeListingId(listing?.id);
+    if (id) byId.set(id, listing);
+  }
+  return byId;
+}
+
+function isLocalListingSummaryFresh(localListing, expectedListing = null) {
+  if (!localListing?.id) return false;
+  if (!expectedListing?.updatedAt) return true;
+
+  const localUpdatedAt = normalizeOptionalDateValue(localListing.updatedAt || localListing.createdAt);
+  const expectedUpdatedAt = normalizeOptionalDateValue(expectedListing.updatedAt || expectedListing.createdAt);
+  if (!expectedUpdatedAt) return true;
+  if (!localUpdatedAt) return false;
+
+  return compareIsoDates(localUpdatedAt, expectedUpdatedAt) >= 0;
 }
 
 export function isValidControlPin(pin) {
@@ -485,6 +557,15 @@ export async function resolveListingShareTarget(listingId, pageSize = DEFAULT_LI
   const safePageSize = Number.isFinite(Number(pageSize)) && Number(pageSize) > 0
     ? Number(pageSize)
     : DEFAULT_LISTINGS_PAGE_SIZE;
+  const localIndex = loadLocalMatchIndex();
+  const localIndexPosition = localIndex?.entries?.findIndex((listing) => listing.id === normalizedListingId) ?? -1;
+
+  if (localIndexPosition >= 0) {
+    return {
+      listing: localIndex.entries[localIndexPosition],
+      pageIndex: Math.floor(localIndexPosition / safePageSize),
+    };
+  }
 
   if (!firebase) {
     const listings = sortListingsByCreatedAtDesc(loadLocalListings());
@@ -498,13 +579,22 @@ export async function resolveListingShareTarget(listingId, pageSize = DEFAULT_LI
   }
 
   try {
+    const remoteMeta = await loadRemoteListingsMeta(firebase);
+    const matchIndex = await loadMatchIndexCandidates(firebase, remoteMeta);
+    const matchIndexPosition = matchIndex?.entries?.findIndex((listing) => listing.id === normalizedListingId) ?? -1;
+    if (matchIndexPosition >= 0) {
+      return {
+        listing: matchIndex.entries[matchIndexPosition],
+        pageIndex: Math.floor(matchIndexPosition / safePageSize),
+      };
+    }
+
     const listing = await loadRemoteListingById(firebase, normalizedListingId);
     if (!listing) return null;
 
-    const newerCount = await countRemoteListingsNewerThan(firebase, listing);
     return {
       listing,
-      pageIndex: Math.floor(newerCount / safePageSize),
+      pageIndex: 0,
     };
   } catch (error) {
     console.warn("공유 링크 대상 게시글 위치를 찾지 못했습니다.", error);
@@ -611,14 +701,28 @@ async function loadMatchIndexCandidates(firebase, remoteMeta = null) {
     };
   }
 
+  const syncedIndex = await syncLocalMatchIndexChanges(firebase, localIndex, remoteMeta);
+  if (shouldUseLocalMatchIndex(syncedIndex, remoteMeta)) {
+    return {
+      entries: syncedIndex.entries,
+      revision: syncedIndex.revision,
+      source: "match-index-incremental",
+    };
+  }
+
   const entries = await loadRemoteMatchIndexEntries(firebase, remoteMeta);
-  if (!hasCompleteMatchIndexEntries(entries, remoteMeta)) return null;
+  if (!hasExactMatchIndexEntries(entries, remoteMeta)) {
+    warnMatchIndexMismatch("remote-shards", entries, remoteMeta);
+    return null;
+  }
 
   const nextIndex = {
     schemaVersion: MATCH_INDEX_SCHEMA_VERSION,
     revision: getRemoteMatchIndexRevision(remoteMeta),
     shardCount: getRemoteMatchIndexShardCount(remoteMeta),
+    activeCount: getRemoteActiveCount(remoteMeta),
     updatedAt: normalizeOptionalDateValue(remoteMeta?.matchIndexUpdatedAt),
+    lastSyncAt: getMatchIndexSyncTime(entries, remoteMeta),
     entries,
   };
   saveLocalMatchIndex(nextIndex);
@@ -640,14 +744,109 @@ function shouldUseLocalMatchIndex(localIndex = null, remoteMeta = null) {
       && localIndex.schemaVersion === MATCH_INDEX_SCHEMA_VERSION
       && localIndex.revision === getRemoteMatchIndexRevision(remoteMeta)
       && localIndex.shardCount === getRemoteMatchIndexShardCount(remoteMeta)
-      && hasCompleteMatchIndexEntries(localIndex.entries, remoteMeta),
+      && hasExactMatchIndexEntries(localIndex.entries, remoteMeta),
   );
 }
 
-function hasCompleteMatchIndexEntries(entries = [], remoteMeta = null) {
+function hasExactMatchIndexEntries(entries = [], remoteMeta = null) {
   const activeCount = getRemoteActiveCount(remoteMeta);
   if (activeCount == null) return true;
-  return entries.length >= activeCount;
+  return entries.length === activeCount;
+}
+
+async function syncLocalMatchIndexChanges(firebase, localIndex = null, remoteMeta = null) {
+  if (!canSyncLocalMatchIndexChanges(localIndex, remoteMeta)) return null;
+
+  const lastSyncAt = normalizeOptionalDateValue(localIndex.lastSyncAt || localIndex.updatedAt);
+  if (!lastSyncAt) return null;
+
+  try {
+    const [changedListings, deletedListings] = await Promise.all([
+      loadRemoteListingChanges(firebase, lastSyncAt),
+      loadRemoteDeletedListingChanges(firebase, lastSyncAt),
+    ]);
+    const entries = mergeMatchIndexChanges(localIndex.entries, changedListings, deletedListings);
+
+    if (!hasExactMatchIndexEntries(entries, remoteMeta)) {
+      warnMatchIndexMismatch("incremental", entries, remoteMeta);
+      return null;
+    }
+
+    const localListings = loadLocalListings();
+    const mergedListings = mergeListingChanges(localListings, changedListings, deletedListings);
+    const nextSyncState = createListingsSyncState(mergedListings, remoteMeta, loadLocalSyncState());
+    saveLocalListings(mergedListings, nextSyncState);
+
+    const nextIndex = {
+      schemaVersion: MATCH_INDEX_SCHEMA_VERSION,
+      revision: getRemoteMatchIndexRevision(remoteMeta),
+      shardCount: getRemoteMatchIndexShardCount(remoteMeta),
+      activeCount: getRemoteActiveCount(remoteMeta),
+      updatedAt: normalizeOptionalDateValue(remoteMeta?.matchIndexUpdatedAt),
+      lastSyncAt: getMatchIndexSyncTime(entries, remoteMeta, changedListings, deletedListings, lastSyncAt),
+      entries,
+    };
+    saveLocalMatchIndex(nextIndex);
+    return nextIndex;
+  } catch (error) {
+    console.warn("Match index incremental sync failed.", error);
+    return null;
+  }
+}
+
+function canSyncLocalMatchIndexChanges(localIndex = null, remoteMeta = null) {
+  return Boolean(
+    localIndex
+      && localIndex.schemaVersion === MATCH_INDEX_SCHEMA_VERSION
+      && localIndex.shardCount === getRemoteMatchIndexShardCount(remoteMeta)
+      && Number(localIndex.revision || 0) > 0
+      && Number(localIndex.revision || 0) < getRemoteMatchIndexRevision(remoteMeta)
+      && normalizeOptionalDateValue(localIndex.lastSyncAt || localIndex.updatedAt),
+  );
+}
+
+function mergeMatchIndexChanges(entries = [], changedListings = [], deletedListings = []) {
+  const byId = new Map((entries || [])
+    .map((entry) => normalizeMatchIndexEntry(entry?.id, entry))
+    .filter(Boolean)
+    .map((entry) => [entry.id, entry]));
+
+  for (const listing of changedListings || []) {
+    if (!listing?.id) continue;
+    if (listing.active === false) {
+      byId.delete(listing.id);
+      continue;
+    }
+    const entry = createMatchIndexEntryFromListing(listing);
+    if (entry) byId.set(entry.id, normalizeMatchIndexEntry(entry.id, entry));
+  }
+
+  for (const deletion of deletedListings || []) {
+    const listingId = normalizeListingId(deletion?.listingId || deletion?.id);
+    if (listingId) byId.delete(listingId);
+  }
+
+  return sortListingsByCreatedAtDesc([...byId.values()]);
+}
+
+function warnMatchIndexMismatch(source, entries = [], remoteMeta = null) {
+  console.warn("Match index entry count does not match activeCount.", {
+    source,
+    entryCount: Array.isArray(entries) ? entries.length : 0,
+    activeCount: getRemoteActiveCount(remoteMeta),
+    matchIndexRevision: getRemoteMatchIndexRevision(remoteMeta),
+  });
+}
+
+function getMatchIndexSyncTime(entries = [], remoteMeta = null, changedListings = [], deletedListings = [], previousLastSyncAt = "") {
+  return getMaxIsoDate([
+    previousLastSyncAt,
+    normalizeOptionalDateValue(remoteMeta?.updatedAt),
+    normalizeOptionalDateValue(remoteMeta?.matchIndexUpdatedAt),
+    getMaxIsoDate((entries || []).map((entry) => entry?.updatedAt || entry?.createdAt || "")),
+    getMaxIsoDate((changedListings || []).map((listing) => listing?.updatedAt || listing?.createdAt || "")),
+    getMaxIsoDate((deletedListings || []).map((deletion) => deletion?.updatedAt || deletion?.deletedAt || "")),
+  ]);
 }
 
 async function loadRemoteMatchIndexEntries(firebase, remoteMeta = null) {
@@ -667,22 +866,24 @@ async function loadRemoteMatchIndexEntries(firebase, remoteMeta = null) {
     }
   }
 
-  return sortListingsByCreatedAtDesc(entries);
+  return dedupeMatchIndexEntries(entries);
 }
 
 function loadLocalMatchIndex() {
   try {
     const parsed = JSON.parse(localStorage.getItem(LISTING_MATCH_INDEX_KEY) || "null");
     if (!parsed || typeof parsed !== "object") return null;
-    const entries = (Array.isArray(parsed.entries) ? parsed.entries : [])
-      .map((entry) => normalizeMatchIndexEntry(entry?.id, entry))
-      .filter(Boolean);
+    const entries = dedupeMatchIndexEntries(Array.isArray(parsed.entries) ? parsed.entries : []);
 
     return {
       schemaVersion: Number(parsed.schemaVersion || 0),
       revision: Number(parsed.revision || 0),
       shardCount: Number(parsed.shardCount || 0),
+      activeCount: parsed.activeCount != null && Number.isFinite(Number(parsed.activeCount))
+        ? Math.max(0, Math.floor(Number(parsed.activeCount)))
+        : null,
       updatedAt: normalizeOptionalDateValue(parsed.updatedAt),
+      lastSyncAt: normalizeOptionalDateValue(parsed.lastSyncAt || parsed.updatedAt),
       entries,
     };
   } catch {
@@ -696,12 +897,25 @@ function saveLocalMatchIndex(index) {
       schemaVersion: MATCH_INDEX_SCHEMA_VERSION,
       revision: Number(index?.revision || 0),
       shardCount: Number(index?.shardCount || 0),
+      activeCount: index?.activeCount != null && Number.isFinite(Number(index.activeCount))
+        ? Math.max(0, Math.floor(Number(index.activeCount)))
+        : null,
       updatedAt: normalizeOptionalDateValue(index?.updatedAt),
-      entries: (index?.entries || []).map(compactMatchIndexEntry).filter(Boolean),
+      lastSyncAt: normalizeOptionalDateValue(index?.lastSyncAt || index?.updatedAt),
+      entries: dedupeMatchIndexEntries(index?.entries || []).map(compactMatchIndexEntry).filter(Boolean),
     }));
   } catch {
     // Match index cache is an optimization; failing to write it should not break listings.
   }
+}
+
+function dedupeMatchIndexEntries(entries = []) {
+  const byId = new Map();
+  for (const entry of entries || []) {
+    const normalizedEntry = normalizeMatchIndexEntry(entry?.id, entry);
+    if (normalizedEntry) byId.set(normalizedEntry.id, normalizedEntry);
+  }
+  return sortListingsByCreatedAtDesc([...byId.values()]);
 }
 
 function compactMatchIndexEntry(entry = {}) {
@@ -888,6 +1102,16 @@ function compareListingFreshness(listing, deletion) {
   return listingTime > deletionTime ? 1 : -1;
 }
 
+function compareIsoDates(left, right) {
+  const leftTime = Date.parse(normalizeOptionalDateValue(left));
+  const rightTime = Date.parse(normalizeOptionalDateValue(right));
+  if (Number.isNaN(leftTime) && Number.isNaN(rightTime)) return 0;
+  if (Number.isNaN(leftTime)) return -1;
+  if (Number.isNaN(rightTime)) return 1;
+  if (leftTime === rightTime) return 0;
+  return leftTime > rightTime ? 1 : -1;
+}
+
 function getRequiredListingCandidateCount(remoteMeta = null, requiredCount = DEFAULT_LISTINGS_PAGE_SIZE, candidateLimit = DEFAULT_LISTING_SORT_CANDIDATE_LIMIT) {
   const safeRequiredCount = Number.isFinite(Number(requiredCount)) && Number(requiredCount) > 0
     ? Math.floor(Number(requiredCount))
@@ -942,6 +1166,19 @@ function createListingPageResult(
     exhausted: Boolean(options.exhausted),
     needsSummaryHydration: Boolean(options.indexOnly),
     source,
+  };
+}
+
+function attachListingsMetaResult(result, remoteMeta = null) {
+  if (!remoteMeta) return result;
+  return {
+    ...result,
+    revision: Number(remoteMeta.revision || 0),
+    activeCount: getRemoteActiveCount(remoteMeta),
+    matchIndexRevision: getRemoteMatchIndexRevision(remoteMeta),
+    matchIndexShardCount: getRemoteMatchIndexShardCount(remoteMeta),
+    metaUpdatedAt: normalizeOptionalDateValue(remoteMeta.updatedAt),
+    matchIndexUpdatedAt: normalizeOptionalDateValue(remoteMeta.matchIndexUpdatedAt),
   };
 }
 
@@ -1622,7 +1859,7 @@ async function loadRemoteListingChanges(firebase, lastSyncAt) {
   const snapshot = await firebase.getDocs(
     firebase.query(
       firebase.collection(firebase.db, LISTINGS_COLLECTION),
-      firebase.where("updatedAt", ">=", lastSyncAt),
+      firebase.where("updatedAt", ">", lastSyncAt),
     ),
   );
 
@@ -1649,31 +1886,11 @@ async function loadRemoteListingPage(firebase, options = {}) {
     .filter((listing) => listing.active !== false);
 }
 
-async function countRemoteListingsNewerThan(firebase, listing) {
-  const createdAt = normalizeOptionalDateValue(listing?.createdAt);
-  if (!createdAt) return 0;
-
-  if (firebase.getCountFromServer) {
-    const snapshot = await firebase.getCountFromServer(
-      firebase.query(
-        firebase.collection(firebase.db, LISTINGS_COLLECTION),
-        firebase.where("createdAt", ">", createdAt),
-      ),
-    );
-    const count = Number(snapshot.data()?.count ?? 0);
-    return Number.isFinite(count) ? count : 0;
-  }
-
-  const listings = sortListingsByCreatedAtDesc(loadLocalListings());
-  const index = listings.findIndex((candidate) => candidate.id === listing.id);
-  return index >= 0 ? index : 0;
-}
-
 async function loadRemoteDeletedListingChanges(firebase, lastSyncAt) {
   const snapshot = await firebase.getDocs(
     firebase.query(
       firebase.collection(firebase.db, DELETED_LISTINGS_COLLECTION),
-      firebase.where("updatedAt", ">=", lastSyncAt),
+      firebase.where("updatedAt", ">", lastSyncAt),
     ),
   );
 

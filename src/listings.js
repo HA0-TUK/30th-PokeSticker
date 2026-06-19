@@ -21,6 +21,7 @@ import {
   deletePersonalListing,
   ensureListingControl,
   getListingStoreMode,
+  hasRemoteListingsChanged,
   LISTINGS_BROADCAST_CHANNEL,
   LISTINGS_REFRESH_KEY,
   loadCachedListings,
@@ -75,6 +76,9 @@ let paginationState = {
   startItem: 0,
   endItem: 0,
   totalCount: 0,
+  revision: 0,
+  matchIndexRevision: 0,
+  activeCount: null,
 };
 const carouselStates = new WeakMap();
 const preloadedImageSources = new Set();
@@ -185,7 +189,9 @@ async function renderListings(pageIndex = paginationState.pageIndex || 0, option
     options.focusListingId,
   );
   const listings = sortedResult.needsSummaryHydration
-    ? await loadListingSummariesByIds(sortedResult.listings.map((listing) => listing.id))
+    ? await loadListingSummariesByIds(sortedResult.listings.map((listing) => listing.id), {
+      expectedListings: sortedResult.listings,
+    })
     : sortedResult.listings;
   const renderResult = {
     ...sortedResult,
@@ -298,13 +304,21 @@ async function goToListingsPage(pageIndex) {
 
 function queueListingsRefresh(reason = "manual", options = {}) {
   const now = Date.now();
-  if (!options.immediate && now - lastRefreshStartedAt < LISTINGS_REFRESH_THROTTLE_MS) {
+  if (!options.force && now - lastRefreshStartedAt < LISTINGS_REFRESH_THROTTLE_MS) {
     return refreshInFlight;
   }
   if (refreshInFlight) return refreshInFlight;
 
   lastRefreshStartedAt = now;
-  refreshInFlight = renderListings(paginationState.pageIndex || 0)
+  refreshInFlight = (async () => {
+    if (listingStoreMode === "firebase" && options.checkRemote !== false) {
+      const changed = await hasRemoteListingsChanged(paginationState);
+      if (!changed) return null;
+    }
+    return renderListings(paginationState.pageIndex || 0, {
+      forceRender: true,
+    });
+  })()
     .catch((error) => console.warn("교환 글 목록을 새로고침하지 못했습니다.", reason, error))
     .finally(() => {
       refreshInFlight = null;
@@ -317,20 +331,20 @@ function setupListingsAutoRefresh() {
   if (autoRefreshInitialized) return;
   autoRefreshInitialized = true;
 
-  window.addEventListener("focus", () => queueListingsRefresh("focus", { immediate: true }));
+  window.addEventListener("focus", () => queueListingsRefresh("focus"));
   document.addEventListener("visibilitychange", () => {
-    if (!document.hidden) queueListingsRefresh("visible", { immediate: true });
+    if (!document.hidden) queueListingsRefresh("visible");
   });
   window.addEventListener("storage", (event) => {
-    if (event.key === LISTINGS_REFRESH_KEY) queueListingsRefresh("storage", { immediate: true });
+    if (event.key === LISTINGS_REFRESH_KEY) queueListingsRefresh("storage");
   });
-  window.addEventListener(LISTINGS_REFRESH_KEY, () => queueListingsRefresh("local-event", { immediate: true }));
+  window.addEventListener(LISTINGS_REFRESH_KEY, () => queueListingsRefresh("local-event"));
 
   if (typeof BroadcastChannel !== "undefined") {
     try {
       listingsBroadcastChannel = new BroadcastChannel(LISTINGS_BROADCAST_CHANNEL);
       listingsBroadcastChannel.addEventListener("message", () => {
-        queueListingsRefresh("broadcast", { immediate: true });
+        queueListingsRefresh("broadcast");
       });
     } catch {
       listingsBroadcastChannel = null;
@@ -428,6 +442,11 @@ function renderPagination(result = {}) {
     startItem: Number(result.startItem || 0),
     endItem: Number(result.endItem || 0),
     totalCount: Number(result.totalCount || result.loadedCount || result.listings?.length || 0),
+    revision: Number(result.revision || 0),
+    matchIndexRevision: Number(result.matchIndexRevision || 0),
+    activeCount: result.activeCount != null && Number.isFinite(Number(result.activeCount))
+      ? Math.max(0, Math.floor(Number(result.activeCount)))
+      : null,
   };
 
   const shouldShow = paginationState.totalCount > 0;
