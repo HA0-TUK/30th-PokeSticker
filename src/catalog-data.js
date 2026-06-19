@@ -2326,7 +2326,7 @@ export const stickers = [
   },
   {
     "id": "413_2",
-    "name": "도롱마당(슈레)",
+    "name": "도롱마담(슈레)",
     "img": "/icons/0413_02.png"
   },
   {
