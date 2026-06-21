@@ -242,51 +242,18 @@ textarea {
 }
 
 .body-text-editor {
-  position: relative;
   border-radius: 8px;
   background: #111827;
 }
 
 .body-text-editor textarea {
-  position: relative;
-  z-index: 1;
   display: block;
-  background: transparent;
-  color: transparent;
   line-height: 1.5;
-  caret-color: var(--ink);
-  white-space: pre-wrap;
-  overflow-wrap: break-word;
-  word-break: break-word;
 }
 
 .body-text-editor textarea::placeholder {
   color: var(--muted);
   opacity: 1;
-}
-
-.body-limit-highlight {
-  position: absolute;
-  inset: 0;
-  z-index: 0;
-  overflow: hidden;
-  border: 1px solid transparent;
-  border-radius: 8px;
-  padding: 11px 12px;
-  color: var(--ink);
-  font: inherit;
-  line-height: 1.5;
-  pointer-events: none;
-  white-space: pre-wrap;
-  overflow-wrap: break-word;
-  word-break: break-word;
-}
-
-.body-limit-highlight .overflow {
-  border-radius: 3px;
-  background: rgba(239, 68, 68, 0.58);
-  box-decoration-break: clone;
-  -webkit-box-decoration-break: clone;
 }
 
 .body-limit-row {

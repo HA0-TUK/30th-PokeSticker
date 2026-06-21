@@ -81,7 +81,6 @@ const elements = {
   contact: document.getElementById("contact"),
   bodyText: document.getElementById("bodyText"),
   bodyLimitCounter: document.getElementById("bodyLimitCounter"),
-  bodyLimitHighlight: document.getElementById("bodyLimitHighlight"),
   imageInput: document.getElementById("imageInput"),
   imagePreview: document.getElementById("imagePreview"),
   controlPin: document.getElementById("controlPin"),
@@ -112,7 +111,6 @@ elements.restoreMyListingButton.addEventListener("click", restoreMyListing);
 elements.imageInput.addEventListener("change", handleImageInput);
 elements.imagePreview.addEventListener("click", handleImagePreviewClick);
 elements.controlPin.addEventListener("input", handleControlPinInput);
-elements.bodyText.addEventListener("scroll", syncBodyLimitHighlightScroll);
 
 applyTrainerInfo(currentTrainer);
 renderBodyLimitFeedback();
@@ -1219,33 +1217,6 @@ function renderBodyLimitFeedback() {
     elements.bodyLimitCounter.classList.toggle("over-limit", overflowCount > 0);
   }
 
-  renderBodyLimitHighlight(value, overflowCount);
-  syncBodyLimitHighlightScroll();
-}
-
-function renderBodyLimitHighlight(value, overflowCount) {
-  if (!elements.bodyLimitHighlight) return;
-  elements.bodyLimitHighlight.innerHTML = "";
-
-  if (overflowCount <= 0) {
-    elements.bodyLimitHighlight.append(document.createTextNode(value || ""));
-    return;
-  }
-
-  const allowedText = value.slice(0, LISTING_BODY_MAX_LENGTH);
-  const overflowText = value.slice(LISTING_BODY_MAX_LENGTH);
-  elements.bodyLimitHighlight.append(document.createTextNode(allowedText));
-
-  const overflow = document.createElement("span");
-  overflow.className = "overflow";
-  overflow.textContent = overflowText;
-  elements.bodyLimitHighlight.append(overflow);
-}
-
-function syncBodyLimitHighlightScroll() {
-  if (!elements.bodyLimitHighlight || !elements.bodyText) return;
-  elements.bodyLimitHighlight.scrollTop = elements.bodyText.scrollTop;
-  elements.bodyLimitHighlight.scrollLeft = elements.bodyText.scrollLeft;
 }
 
 function getControlPinValue() {
