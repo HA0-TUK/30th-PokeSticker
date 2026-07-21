@@ -184,6 +184,40 @@ nav {
   line-height: 1.5;
 }
 
+.section-title-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.listing-filter-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 36px;
+  padding: 0 11px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: #111827;
+  color: #e5e7eb;
+  font-size: 12px;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
+.listing-filter-toggle input {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--yellow);
+}
+
+.section-title-actions #resetListingsButton {
+  min-height: 36px;
+}
+
 .badge {
   flex: 0 0 auto;
   display: inline-flex;
@@ -1356,6 +1390,10 @@ button.secondary:hover {
   .listing-body {
     flex-direction: column;
     align-items: stretch;
+  }
+
+  .section-title-actions {
+    justify-content: flex-start;
   }
 
   .compact-mode-field {

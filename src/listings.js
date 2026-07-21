@@ -6,7 +6,10 @@ import {
   sortListingsForProfile,
 } from "./importer.js";
 import {
+  SHEET_CARD_RENDER_PURPOSE,
+  SHEET_FULL_RENDER_PURPOSE,
   SHEET_LAYOUT_VERSION,
+  SHEET_RENDER_CACHE_VERSION,
   createProfileSheetImageDescriptors,
   renderProfileSheetImageBlob,
 } from "./profile-sheet.js";
@@ -33,6 +36,8 @@ import {
 
 const PROFILE_KEY = "pokemon-market-profile";
 const TRAINER_KEY = "pokemon-market-trainer";
+const RECENT_PRIORITY_KEY = "pokemon-market-listings-recent-priority";
+const RECENT_PRIORITY_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
 const LISTINGS_REFRESH_THROTTLE_MS = 5000;
 const LISTING_SHARE_PARAM = "listing";
 const catalogIndex = createCatalogIndex(stickers);
@@ -44,6 +49,7 @@ const listingPageButtons = document.getElementById("listingPageButtons");
 const previousListingsPageButton = document.getElementById("previousListingsPageButton");
 const nextListingsPageButton = document.getElementById("nextListingsPageButton");
 const resetListingsButton = document.getElementById("resetListingsButton");
+const recentPriorityCheckbox = document.getElementById("recentPriorityCheckbox");
 const listingIntro = document.querySelector(".section-title p");
 const imageModal = document.getElementById("imageModal");
 const modalImage = document.getElementById("modalImage");
@@ -59,6 +65,7 @@ let listingStoreMode = "local";
 let currentProfile = loadProfile();
 let modalImages = [];
 let modalIndex = 0;
+let modalListing = null;
 let activeCarousel = null;
 let carouselObserver = null;
 let autoRefreshInitialized = false;
@@ -70,6 +77,7 @@ let sharedListingId = getSharedListingId();
 let highlightedListingId = sharedListingId;
 let renderedListingsById = new Map();
 let renderedListingsSignature = "";
+let lastListingPageResult = null;
 let paginationState = {
   pageIndex: 0,
   totalPages: 1,
@@ -99,6 +107,11 @@ resetListingsButton.addEventListener("click", async () => {
   await deletePersonalListing();
   await renderListings(0);
 });
+
+if (recentPriorityCheckbox) {
+  recentPriorityCheckbox.checked = loadRecentPriorityPreference();
+  recentPriorityCheckbox.addEventListener("change", handleRecentPriorityPreferenceChange);
+}
 
 previousListingsPageButton.addEventListener("click", () => goToListingsPage(paginationState.pageIndex - 1));
 nextListingsPageButton.addEventListener("click", () => goToListingsPage(paginationState.pageIndex + 1));
@@ -149,9 +162,11 @@ async function initializeListingsPage() {
       : "게시판에 접근할 수 없습니다.";
 
   if (listingStoreMode === "firebase") {
-    const cachedListings = sortListingsForProfile(
-      loadCachedListings().slice(0, DEFAULT_LISTING_SORT_CANDIDATE_LIMIT),
-      loadProfile(),
+    const cachedListings = applyRecentPriorityOrdering(
+      sortListingsForProfile(
+        loadCachedListings().slice(0, DEFAULT_LISTING_SORT_CANDIDATE_LIMIT),
+        loadProfile(),
+      ),
     ).slice(0, DEFAULT_LISTINGS_PAGE_SIZE);
     if (!sharedListingId && cachedListings.length > 0) {
       await prepareGeneratedSheetSourcesForRender(cachedListings);
@@ -177,6 +192,56 @@ async function initializeListingsPage() {
   setupListingsAutoRefresh();
 }
 
+function handleRecentPriorityPreferenceChange() {
+  saveRecentPriorityPreference(Boolean(recentPriorityCheckbox?.checked));
+  if (!lastListingPageResult) {
+    renderListings(0, { forceRender: true });
+    return;
+  }
+
+  renderListingsFromPageResult({
+    ...lastListingPageResult,
+    pageIndex: 0,
+  }, {
+    forceRender: true,
+  }).catch((error) => console.warn("최근 글 우선 정렬을 적용하지 못했습니다.", error));
+}
+
+function applyRecentPriorityOrdering(listings = []) {
+  if (!loadRecentPriorityPreference()) return listings;
+
+  const now = Date.now();
+  const recent = [];
+  const older = [];
+  for (const listing of listings || []) {
+    const target = isRecentListing(listing, now) ? recent : older;
+    target.push(listing);
+  }
+  return [...recent, ...older];
+}
+
+function isRecentListing(listing, now = Date.now()) {
+  const time = Date.parse(listing?.updatedAt || listing?.createdAt || "");
+  if (Number.isNaN(time)) return false;
+  return now - time <= RECENT_PRIORITY_WINDOW_MS;
+}
+
+function loadRecentPriorityPreference() {
+  try {
+    return localStorage.getItem(RECENT_PRIORITY_KEY) === "true";
+  } catch {
+    return false;
+  }
+}
+
+function saveRecentPriorityPreference(enabled) {
+  try {
+    localStorage.setItem(RECENT_PRIORITY_KEY, enabled ? "true" : "false");
+  } catch {
+    // Ignore storage failures; the current checkbox state is still applied.
+  }
+}
+
 async function renderListings(pageIndex = paginationState.pageIndex || 0, options = {}) {
   currentProfile = loadProfile();
   const result = await loadStoredListingPage({
@@ -184,6 +249,12 @@ async function renderListings(pageIndex = paginationState.pageIndex || 0, option
     pageSize: DEFAULT_LISTINGS_PAGE_SIZE,
     candidateLimit: DEFAULT_LISTING_SORT_CANDIDATE_LIMIT,
   });
+  lastListingPageResult = result;
+  await renderListingsFromPageResult(result, options);
+}
+
+async function renderListingsFromPageResult(result = {}, options = {}) {
+  currentProfile = loadProfile();
   const sortedResult = focusListingPageResult(
     createProfileSortedPageResult(result, currentProfile),
     options.focusListingId,
@@ -216,7 +287,7 @@ async function renderListings(pageIndex = paginationState.pageIndex || 0, option
 
 function createProfileSortedPageResult(result = {}, profile = null) {
   const candidates = Array.isArray(result.candidates) ? result.candidates : result.listings || [];
-  const sortedCandidates = sortListingsForProfile(candidates, profile);
+  const sortedCandidates = applyRecentPriorityOrdering(sortListingsForProfile(candidates, profile));
   const pageSize = Number.isFinite(Number(result.pageSize)) && Number(result.pageSize) > 0
     ? Math.floor(Number(result.pageSize))
     : DEFAULT_LISTINGS_PAGE_SIZE;
@@ -921,10 +992,13 @@ async function handleListingListClick(event) {
     }
     ensureCarouselLoaded(carousel);
     await ensureGeneratedSheetSource(carousel, state.images[state.activeIndex]);
-    const modalImageList = await loadCarouselModalImages(carousel);
-    await ensureGeneratedSheetSource(carousel, modalImageList[state.activeIndex]);
+    const baseModalImages = await loadCarouselModalImages(carousel);
+    const modalImageList = createModalImageList(state.listing, baseModalImages);
+    if (isLocalGeneratedSheetImage(modalImageList[state.activeIndex])) {
+      await getOrCreateGeneratedSheetSource(state.listing, modalImageList[state.activeIndex]);
+    }
     if (!getListingImageSource(modalImageList[state.activeIndex])) return;
-    showImageModal(modalImageList, state.activeIndex);
+    showImageModal(modalImageList, state.activeIndex, state.listing);
     return;
   }
 
@@ -1135,21 +1209,28 @@ async function getOrCreateGeneratedSheetSource(listing, image) {
   if (image.objectUrl) return image.objectUrl;
 
   const cachedBlob = await loadGeneratedSheetBlob(image.cacheKey);
-  const blob = cachedBlob || (await renderProfileSheetImageBlob(listing, {
-    pageIndex: image.sheetPageIndex || 0,
-  })).blob;
+  const renderedImage = cachedBlob
+    ? null
+    : await renderProfileSheetImageBlob(listing, {
+      pageIndex: image.sheetPageIndex || 0,
+      purpose: image.sheetRenderPurpose || SHEET_CARD_RENDER_PURPOSE,
+    });
+  const blob = cachedBlob || renderedImage?.blob;
+  if (!blob) return "";
 
   if (!cachedBlob) {
     await saveGeneratedSheetBlob(image.cacheKey, blob, {
-      width: image.width,
-      height: image.height,
-      type: image.type,
+      width: renderedImage?.width || image.width,
+      height: renderedImage?.height || image.height,
+      type: renderedImage?.type || image.type,
     });
   }
 
   const objectUrl = rememberGeneratedSheetObjectUrl(image.cacheKey, blob);
   image.objectUrl = objectUrl;
   image.url = objectUrl;
+  if (renderedImage?.width) image.width = renderedImage.width;
+  if (renderedImage?.height) image.height = renderedImage.height;
   image.loadFailed = false;
   return objectUrl;
 }
@@ -1157,10 +1238,7 @@ async function getOrCreateGeneratedSheetSource(listing, image) {
 async function loadCarouselModalImages(carousel) {
   const state = carouselStates.get(carousel);
   if (!state) return [];
-  if (state.detailLoaded) {
-    await ensureAllGeneratedSheetSources(carousel);
-    return state.images;
-  }
+  if (state.detailLoaded) return state.images;
 
   const expectedImageCount = getExpectedCarouselImageCount(state.listing, state.images);
   if (!shouldTryLoadListingDetails(state, expectedImageCount)) {
@@ -1177,7 +1255,6 @@ async function loadCarouselModalImages(carousel) {
         renderedListingsById.set(listingWithDetails.id, listingWithDetails);
       }
       state.detailLoaded = true;
-      await ensureAllGeneratedSheetSources(carousel);
       return state.images;
     })
     .catch((error) => {
@@ -1190,17 +1267,6 @@ async function loadCarouselModalImages(carousel) {
     });
 
   return state.detailLoading;
-}
-
-async function ensureAllGeneratedSheetSources(carousel) {
-  const state = carouselStates.get(carousel);
-  if (!state) return;
-
-  for (const image of state.images) {
-    if (isLocalGeneratedSheetImage(image)) {
-      await ensureGeneratedSheetSource(carousel, image);
-    }
-  }
 }
 
 function shouldTryLoadListingDetails(state, expectedImageCount) {
@@ -1225,6 +1291,7 @@ function scheduleAdjacentImagePreload(images, activeIndex) {
 }
 
 function preloadListingImage(image) {
+  if (!isLocalGeneratedSheetImage(image)) return;
   const source = getListingImageSource(image);
   if (!source || preloadedImageSources.has(source)) return;
 
@@ -1255,19 +1322,31 @@ function isEditedListing(listing) {
   return Math.abs(updatedTime - createdTime) > 1000;
 }
 
-function showImageModal(images, index = 0) {
+function showImageModal(images, index = 0, listing = null) {
   modalImages = Array.isArray(images) ? images.filter(Boolean) : [images].filter(Boolean);
   modalIndex = Math.max(0, Math.min(index, modalImages.length - 1));
-  showModalImageAt(modalIndex);
+  modalListing = listing;
+  void showModalImageAt(modalIndex);
   imageModal.classList.remove("hidden");
 }
 
-function showModalImageAt(nextIndex) {
+async function showModalImageAt(nextIndex) {
   if (modalImages.length === 0) return;
 
   modalIndex = (nextIndex + modalImages.length) % modalImages.length;
   const image = modalImages[modalIndex];
-  modalImage.src = getListingImageSource(image);
+  let source = getListingImageSource(image);
+  if (!source && isLocalGeneratedSheetImage(image) && modalListing) {
+    const expectedIndex = modalIndex;
+    source = await getOrCreateGeneratedSheetSource(modalListing, image);
+    if (modalIndex !== expectedIndex) return;
+  }
+
+  if (source) {
+    modalImage.src = source;
+  } else {
+    modalImage.removeAttribute("src");
+  }
   modalImage.alt = image.name || "확대된 첨부 이미지";
   modalCounter.textContent = `${modalIndex + 1} / ${modalImages.length}`;
   modalPreviousButton.classList.toggle("hidden", modalImages.length <= 1);
@@ -1346,9 +1425,22 @@ function createFallbackPreviewColumn(label, groups, type) {
 function normalizeListingImages(listing) {
   if (!listing) return [];
   return [
-    ...createListingGeneratedSheetImages(listing),
+    ...createListingGeneratedSheetImages(listing, SHEET_CARD_RENDER_PURPOSE),
     ...getListingAttachmentImages(listing),
   ];
+}
+
+function createModalImageList(listing, images = []) {
+  const fullGeneratedImages = new Map(
+    createListingGeneratedSheetImages(listing, SHEET_FULL_RENDER_PURPOSE)
+      .map((image) => [Number(image.sheetPageIndex || 0), image]),
+  );
+
+  return (images || []).map((image) => {
+    if (!isLocalGeneratedSheetImage(image)) return image;
+    const pageIndex = Number(image.sheetPageIndex || 0);
+    return fullGeneratedImages.get(pageIndex) || image;
+  });
 }
 
 async function prepareGeneratedSheetSourcesForRender(listings) {
@@ -1356,7 +1448,7 @@ async function prepareGeneratedSheetSourcesForRender(listings) {
 
   const imageByCacheKey = new Map();
   for (const listing of listings || []) {
-    for (const image of createListingGeneratedSheetImages(listing)) {
+    for (const image of createListingGeneratedSheetImages(listing, SHEET_CARD_RENDER_PURPOSE)) {
       if (image.cacheKey && !generatedSheetMemorySources.has(image.cacheKey)) {
         imageByCacheKey.set(image.cacheKey, image);
       }
@@ -1374,8 +1466,8 @@ async function prepareGeneratedSheetSourcesForRender(listings) {
   }));
 }
 
-function createListingGeneratedSheetImages(listing) {
-  const descriptors = createProfileSheetImageDescriptors(listing);
+function createListingGeneratedSheetImages(listing, purpose = SHEET_CARD_RENDER_PURPOSE) {
+  const descriptors = createProfileSheetImageDescriptors(listing, { purpose });
   const expectedPageCount = Math.max(
     descriptors.length,
     Number.isFinite(Number(listing?.sheetPageCount)) ? Number(listing.sheetPageCount) : 0,
@@ -1386,7 +1478,8 @@ function createListingGeneratedSheetImages(listing) {
     const sheetPageCount = Math.max(1, expectedPageCount);
     const profileSignature = descriptor.profileSignature || listing?.sheetProfileSignature || "";
 
-    const cacheKey = createGeneratedSheetCacheKey(listing, pageIndex, profileSignature);
+    const renderPurpose = descriptor.sheetRenderPurpose || purpose || SHEET_CARD_RENDER_PURPOSE;
+    const cacheKey = createGeneratedSheetCacheKey(listing, pageIndex, profileSignature, renderPurpose);
     const cachedSource = generatedSheetMemorySources.get(cacheKey) || "";
 
     return {
@@ -1398,6 +1491,9 @@ function createListingGeneratedSheetImages(listing) {
       objectUrl: cachedSource,
       profileSignature,
       sheetLayoutVersion: listing?.sheetLayoutVersion || SHEET_LAYOUT_VERSION,
+      sheetRenderPurpose: renderPurpose,
+      sheetRenderScale: descriptor.sheetRenderScale,
+      sheetRenderCacheVersion: descriptor.sheetRenderCacheVersion || SHEET_RENDER_CACHE_VERSION,
       sheetPageIndex: pageIndex,
       sheetPageCount,
       cacheKey,
@@ -1428,10 +1524,11 @@ function getExpectedCarouselImageCount(listing, images = []) {
   return Math.max(images.length, declaredCount, generatedCount + attachmentCount);
 }
 
-function createGeneratedSheetCacheKey(listing, pageIndex, profileSignature) {
+function createGeneratedSheetCacheKey(listing, pageIndex, profileSignature, purpose = SHEET_CARD_RENDER_PURPOSE) {
   return [
     "auto-sheet",
-    "v1",
+    SHEET_RENDER_CACHE_VERSION,
+    normalizeCacheKeyPart(purpose || SHEET_CARD_RENDER_PURPOSE),
     normalizeCacheKeyPart(listing?.id || listing?.ownerUid || "local"),
     normalizeCacheKeyPart(listing?.updatedAt || listing?.createdAt || ""),
     normalizeCacheKeyPart(listing?.sheetLayoutVersion || SHEET_LAYOUT_VERSION),
@@ -1484,6 +1581,7 @@ function hideImageModal() {
   imageModal.classList.add("hidden");
   modalImages = [];
   modalIndex = 0;
+  modalListing = null;
   modalImage.removeAttribute("src");
 }
 

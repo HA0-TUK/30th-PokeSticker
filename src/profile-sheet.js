@@ -1,21 +1,40 @@
-import { getItemKey } from "./importer.js";
+import { getCatalogIdFromImagePath, getItemKey } from "./importer.js";
 
 export const SHEET_WIDTH = 2200;
 export const SHEET_HEIGHT = 1400;
 export const SHEET_LAYOUT_VERSION = "compact-left-no-label-v15-roomier-icon-cells";
+export const SHEET_CARD_RENDER_PURPOSE = "card";
+export const SHEET_FULL_RENDER_PURPOSE = "full";
+export const SHEET_RENDER_CACHE_VERSION = "atlas-v1";
 
 const SHEET_MAX_ITEMS_PER_ROW = 7;
 const SHEET_MAX_ITEM_CELL_WIDTH = 156;
 const SHEET_MAX_ITEM_CELL_HEIGHT = 172;
 const SHEET_MIN_ITEM_CELL_HEIGHT = 132;
 const REFERENCE_ASSET_ORIGIN = "public";
+const ICON_ATLAS_ORIGIN = `${REFERENCE_ASSET_ORIGIN}/icon-atlas`;
 const SHEET_IMAGE_TYPE = "image/webp";
 const SHEET_IMAGE_QUALITY = 0.82;
+const SHEET_RENDER_PURPOSES = {
+  [SHEET_CARD_RENDER_PURPOSE]: {
+    purpose: SHEET_CARD_RENDER_PURPOSE,
+    atlasVariant: "card",
+    scale: 0.4,
+    quality: 0.74,
+  },
+  [SHEET_FULL_RENDER_PURPOSE]: {
+    purpose: SHEET_FULL_RENDER_PURPOSE,
+    atlasVariant: "full",
+    scale: 1,
+    quality: SHEET_IMAGE_QUALITY,
+  },
+};
 const koreanNameCollator = new Intl.Collator("ko-KR", {
   sensitivity: "base",
   numeric: false,
 });
 const canvasImageCache = new Map();
+let iconAtlasManifestPromise = null;
 
 export function createProfileSheetPages(profile) {
   const remainingWantedGroups = cloneSheetGroups(profile?.wantedGroups);
@@ -64,19 +83,23 @@ export function getProfileSheetSignature(profile) {
   });
 }
 
-export function createProfileSheetImageDescriptors(profile) {
+export function createProfileSheetImageDescriptors(profile, options = {}) {
+  const renderOptions = getSheetRenderOptions(options);
   const pages = createProfileSheetPages(profile);
   const profileSignature = getProfileSheetSignature(profile);
 
   return pages.map((_, pageIndex) => ({
     name: getProfileSheetImageName(pageIndex, pages.length),
     type: SHEET_IMAGE_TYPE,
-    width: SHEET_WIDTH,
-    height: SHEET_HEIGHT,
+    width: getScaledSheetSize(SHEET_WIDTH, renderOptions.scale),
+    height: getScaledSheetSize(SHEET_HEIGHT, renderOptions.scale),
     generated: true,
     localGenerated: true,
     profileSignature,
     sheetLayoutVersion: SHEET_LAYOUT_VERSION,
+    sheetRenderPurpose: renderOptions.purpose,
+    sheetRenderScale: renderOptions.scale,
+    sheetRenderCacheVersion: SHEET_RENDER_CACHE_VERSION,
     sheetPageIndex: pageIndex,
     sheetPageCount: pages.length,
     order: pageIndex,
@@ -88,8 +111,9 @@ export async function renderProfileSheetImageBlob(profile, options = {}) {
     pageIndex = 0,
     useImages = true,
     type = SHEET_IMAGE_TYPE,
-    quality = SHEET_IMAGE_QUALITY,
+    quality,
   } = options;
+  const renderOptions = getSheetRenderOptions(options);
   const pages = createProfileSheetPages(profile);
   const selectedPageIndex = clampInteger(pageIndex, 0, Math.max(0, pages.length - 1));
   const pageProfile = pages[selectedPageIndex] || pages[0] || profile;
@@ -100,7 +124,8 @@ export async function renderProfileSheetImageBlob(profile, options = {}) {
       pageCount: pages.length,
       useImages,
       type,
-      quality,
+      quality: Number.isFinite(Number(quality)) ? Number(quality) : renderOptions.quality,
+      renderOptions,
     });
   } catch (error) {
     if (useImages) {
@@ -171,12 +196,17 @@ async function renderProfileSheetPageBlob(profile, options = {}) {
     useImages = true,
     type = SHEET_IMAGE_TYPE,
     quality = SHEET_IMAGE_QUALITY,
+    renderOptions = getSheetRenderOptions(options),
   } = options;
   const canvas = document.createElement("canvas");
-  canvas.width = SHEET_WIDTH;
-  canvas.height = SHEET_HEIGHT;
+  canvas.width = getScaledSheetSize(SHEET_WIDTH, renderOptions.scale);
+  canvas.height = getScaledSheetSize(SHEET_HEIGHT, renderOptions.scale);
 
   const context = canvas.getContext("2d");
+  context.imageSmoothingEnabled = true;
+  context.imageSmoothingQuality = "high";
+  if (renderOptions.scale !== 1) context.scale(renderOptions.scale, renderOptions.scale);
+
   await drawReferenceBackground(context);
   await drawReferenceColumn(context, {
     title: "\uad6c\ud574\uc694",
@@ -189,6 +219,7 @@ async function renderProfileSheetPageBlob(profile, options = {}) {
     accent: "#facc15",
     glow: "rgba(250, 204, 21, 0.55)",
     useImages,
+    renderOptions,
     layoutGroups: profile.layoutWantedGroups || profile.wantedGroups,
   });
   await drawReferenceColumn(context, {
@@ -202,6 +233,7 @@ async function renderProfileSheetPageBlob(profile, options = {}) {
     accent: "#4ade80",
     glow: "rgba(74, 222, 128, 0.48)",
     useImages,
+    renderOptions,
     layoutGroups: profile.layoutOwnedGroups || profile.ownedGroups,
   });
 
@@ -216,6 +248,9 @@ async function renderProfileSheetPageBlob(profile, options = {}) {
     width: canvas.width,
     height: canvas.height,
     generated: true,
+    sheetRenderPurpose: renderOptions.purpose,
+    sheetRenderScale: renderOptions.scale,
+    sheetRenderCacheVersion: SHEET_RENDER_CACHE_VERSION,
     sheetPageIndex: pageIndex,
     sheetPageCount: pageCount,
   };
@@ -235,7 +270,7 @@ async function drawReferenceBackground(context) {
 }
 
 async function drawReferenceColumn(context, options) {
-  const { title, groups, layoutGroups = groups, type, x, y, width, height, accent, glow, useImages } = options;
+  const { title, groups, layoutGroups = groups, type, x, y, width, height, accent, glow, useImages, renderOptions } = options;
   const visibleGroups = getNonEmptySheetGroups(groups);
   const visibleLayoutGroups = getNonEmptySheetGroups(layoutGroups);
 
@@ -301,6 +336,7 @@ async function drawReferenceColumn(context, options) {
       contentHeight,
       useImages,
       layoutGroup.items?.length || group.items?.length || 0,
+      renderOptions,
     );
   }
 }
@@ -368,7 +404,7 @@ function drawDashedReferenceBox(context, x, y, width, height) {
   context.restore();
 }
 
-async function drawReferenceItems(context, items, x, y, width, height, useImages, layoutCount = null) {
+async function drawReferenceItems(context, items, x, y, width, height, useImages, layoutCount = null, renderOptions = getSheetRenderOptions()) {
   if (!items.length || width <= 0 || height <= 0) return;
 
   const sortedItems = [...items].sort(compareItemsByKoreanName);
@@ -381,7 +417,7 @@ async function drawReferenceItems(context, items, x, y, width, height, useImages
     const row = Math.floor(index / layout.columns);
     const cellX = x + column * (layout.cellWidth + layout.gap);
     const cellY = y + row * (layout.cellHeight + layout.gap);
-    await drawReferenceItemCard(context, item, cellX, cellY, layout.cellWidth, layout.cellHeight, useImages);
+    await drawReferenceItemCard(context, item, cellX, cellY, layout.cellWidth, layout.cellHeight, useImages, renderOptions);
   }
 
   if (total < sortedItems.length) {
@@ -393,7 +429,7 @@ async function drawReferenceItems(context, items, x, y, width, height, useImages
   }
 }
 
-async function drawReferenceItemCard(context, item, x, y, width, height, useImages) {
+async function drawReferenceItemCard(context, item, x, y, width, height, useImages, renderOptions = getSheetRenderOptions()) {
   const compact = width < 68 || height < 84;
   const radius = compact ? 7 : 12;
   const paddingX = Math.max(compact ? 3 : 6, Math.min(9, width * 0.07));
@@ -405,10 +441,16 @@ async function drawReferenceItemCard(context, item, x, y, width, height, useImag
 
   drawRoundedRect(context, x, y, width, height, radius, "rgba(255, 255, 255, 0.16)", "rgba(255, 255, 255, 0.28)", 1);
 
-  const imageUrl = getStickerImageUrl(item);
+  const atlasImage = useImages ? await loadStickerAtlasImage(item, renderOptions) : null;
+  const imageUrl = atlasImage ? "" : getStickerImageUrl(item);
   const image = useImages && imageUrl ? await loadCanvasImage(imageUrl) : null;
 
-  if (image) {
+  if (atlasImage) {
+    drawContainAtlasImage(context, atlasImage, imageBoxX, imageBoxY, imageBoxWidth, imageBoxHeight, {
+      alignX: "left",
+      allowUpscale: false,
+    });
+  } else if (image) {
     drawContainImage(context, image, imageBoxX, imageBoxY, imageBoxWidth, imageBoxHeight, {
       alignX: "left",
       allowUpscale: false,
@@ -586,6 +628,45 @@ function getStickerImageUrl(item) {
   return `${REFERENCE_ASSET_ORIGIN}${item.imagePath}`;
 }
 
+async function loadStickerAtlasImage(item, renderOptions = getSheetRenderOptions()) {
+  const catalogId = getStickerCatalogId(item);
+  if (!catalogId) return null;
+
+  const manifest = await loadIconAtlasManifest();
+  const atlasEntry = manifest?.icons?.[catalogId]?.[renderOptions.atlasVariant];
+  if (!atlasEntry?.atlas) return null;
+
+  const image = await loadCanvasImage(`${ICON_ATLAS_ORIGIN}/${atlasEntry.atlas}`);
+  if (!image) return null;
+
+  return {
+    image,
+    sourceX: Number(atlasEntry.x || 0),
+    sourceY: Number(atlasEntry.y || 0),
+    sourceWidth: Number(atlasEntry.w || 0),
+    sourceHeight: Number(atlasEntry.h || 0),
+  };
+}
+
+function getStickerCatalogId(item) {
+  const directCatalogId = String(item?.catalogId ?? "").trim();
+  if (directCatalogId) return directCatalogId;
+
+  const imageCatalogId = getCatalogIdFromImagePath(item?.imagePath);
+  if (imageCatalogId) return imageCatalogId;
+
+  const itemKey = getItemKey(item);
+  return /^[0-9]{4}(?:_[0-9]+)?$/.test(itemKey) ? itemKey : "";
+}
+
+async function loadIconAtlasManifest() {
+  iconAtlasManifestPromise ??= fetch(`${ICON_ATLAS_ORIGIN}/manifest.json`)
+    .then((response) => response.ok ? response.json() : null)
+    .catch(() => null);
+
+  return iconAtlasManifestPromise;
+}
+
 function loadCanvasImage(src) {
   if (!src) return Promise.resolve(null);
   if (canvasImageCache.has(src)) return canvasImageCache.get(src);
@@ -622,6 +703,33 @@ function drawContainImage(context, image, x, y, width, height, options = {}) {
   const offsetX = alignX === "left" ? 0 : alignX === "right" ? width - drawWidth : (width - drawWidth) / 2;
   const offsetY = alignY === "top" ? 0 : alignY === "bottom" ? height - drawHeight : (height - drawHeight) / 2;
   context.drawImage(image, x + offsetX, y + offsetY, drawWidth, drawHeight);
+}
+
+function drawContainAtlasImage(context, atlasImage, x, y, width, height, options = {}) {
+  const { alignX = "center", alignY = "center", allowUpscale = true } = options;
+  const sourceWidth = atlasImage.sourceWidth || 1;
+  const sourceHeight = atlasImage.sourceHeight || 1;
+  const scale = Math.min(
+    allowUpscale ? Number.POSITIVE_INFINITY : 1,
+    width / sourceWidth,
+    height / sourceHeight,
+  );
+  const drawWidth = sourceWidth * scale;
+  const drawHeight = sourceHeight * scale;
+  const offsetX = alignX === "left" ? 0 : alignX === "right" ? width - drawWidth : (width - drawWidth) / 2;
+  const offsetY = alignY === "top" ? 0 : alignY === "bottom" ? height - drawHeight : (height - drawHeight) / 2;
+
+  context.drawImage(
+    atlasImage.image,
+    atlasImage.sourceX,
+    atlasImage.sourceY,
+    sourceWidth,
+    sourceHeight,
+    x + offsetX,
+    y + offsetY,
+    drawWidth,
+    drawHeight,
+  );
 }
 
 function drawRoundedPath(context, x, y, width, height, radius) {
@@ -671,6 +779,23 @@ function canvasToBlob(canvas, type, quality) {
 function getProfileSheetImageName(pageIndex, pageCount) {
   const pageSuffix = pageCount > 1 ? `-${pageIndex + 1}-of-${pageCount}` : "";
   return `poke30-tra-compatible-sheet${pageSuffix}.webp`;
+}
+
+function getSheetRenderOptions(options = {}) {
+  const requestedPurpose = String(options?.purpose || options?.sheetRenderPurpose || SHEET_FULL_RENDER_PURPOSE);
+  const preset = SHEET_RENDER_PURPOSES[requestedPurpose] || SHEET_RENDER_PURPOSES[SHEET_FULL_RENDER_PURPOSE];
+  const scale = Number.isFinite(Number(options?.scale)) && Number(options.scale) > 0
+    ? Number(options.scale)
+    : preset.scale;
+
+  return {
+    ...preset,
+    scale,
+  };
+}
+
+function getScaledSheetSize(size, scale = 1) {
+  return Math.max(1, Math.round(Number(size || 0) * Number(scale || 1)));
 }
 
 function clampInteger(value, min, max) {

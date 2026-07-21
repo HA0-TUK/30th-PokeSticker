@@ -14,10 +14,6 @@ export async function loadGeneratedSheetBlob(cacheKey) {
     const record = await getRecord(db, cacheKey);
     if (!record?.blob) return null;
 
-    await putRecord(db, {
-      ...record,
-      accessedAt: Date.now(),
-    });
     return record.blob;
   } catch (error) {
     console.warn("Generated sheet cache read failed.", error);
