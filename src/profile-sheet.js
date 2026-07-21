@@ -5,7 +5,7 @@ export const SHEET_HEIGHT = 1400;
 export const SHEET_LAYOUT_VERSION = "compact-left-no-label-v15-roomier-icon-cells";
 export const SHEET_CARD_RENDER_PURPOSE = "card";
 export const SHEET_FULL_RENDER_PURPOSE = "full";
-export const SHEET_RENDER_CACHE_VERSION = "atlas-v1";
+export const SHEET_RENDER_CACHE_VERSION = "atlas-v2";
 
 const SHEET_MAX_ITEMS_PER_ROW = 7;
 const SHEET_MAX_ITEM_CELL_WIDTH = 156;
@@ -21,12 +21,14 @@ const SHEET_RENDER_PURPOSES = {
     atlasVariant: "card",
     scale: 0.4,
     quality: 0.74,
+    allowAtlasUpscale: true,
   },
   [SHEET_FULL_RENDER_PURPOSE]: {
     purpose: SHEET_FULL_RENDER_PURPOSE,
     atlasVariant: "full",
     scale: 1,
     quality: SHEET_IMAGE_QUALITY,
+    allowAtlasUpscale: false,
   },
 };
 const koreanNameCollator = new Intl.Collator("ko-KR", {
@@ -448,7 +450,7 @@ async function drawReferenceItemCard(context, item, x, y, width, height, useImag
   if (atlasImage) {
     drawContainAtlasImage(context, atlasImage, imageBoxX, imageBoxY, imageBoxWidth, imageBoxHeight, {
       alignX: "left",
-      allowUpscale: false,
+      allowUpscale: Boolean(renderOptions.allowAtlasUpscale),
     });
   } else if (image) {
     drawContainImage(context, image, imageBoxX, imageBoxY, imageBoxWidth, imageBoxHeight, {
