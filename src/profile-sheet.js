@@ -1,21 +1,40 @@
-import { getItemKey } from "./importer.js";
+import { getCatalogIdFromImagePath, getItemKey } from "./importer.js";
 
 export const SHEET_WIDTH = 2200;
 export const SHEET_HEIGHT = 1400;
 export const SHEET_LAYOUT_VERSION = "compact-left-no-label-v15-roomier-icon-cells";
+export const SHEET_CARD_RENDER_PURPOSE = "card";
+export const SHEET_FULL_RENDER_PURPOSE = "full";
+export const SHEET_RENDER_CACHE_VERSION = "atlas-v1";
 
 const SHEET_MAX_ITEMS_PER_ROW = 7;
 const SHEET_MAX_ITEM_CELL_WIDTH = 156;
 const SHEET_MAX_ITEM_CELL_HEIGHT = 172;
 const SHEET_MIN_ITEM_CELL_HEIGHT = 132;
 const REFERENCE_ASSET_ORIGIN = "public";
+const ICON_ATLAS_ORIGIN = `${REFERENCE_ASSET_ORIGIN}/icon-atlas`;
 const SHEET_IMAGE_TYPE = "image/webp";
 const SHEET_IMAGE_QUALITY = 0.82;
+const SHEET_RENDER_PURPOSES = {
+  [SHEET_CARD_RENDER_PURPOSE]: {
+    purpose: SHEET_CARD_RENDER_PURPOSE,
+    atlasVariant: "card",
+    scale: 0.4,
+    quality: 0.74,
+  },
+  [SHEET_FULL_RENDER_PURPOSE]: {
+    purpose: SHEET_FULL_RENDER_PURPOSE,
+    atlasVariant: "full",
+    scale: 1,
+    quality: SHEET_IMAGE_QUALITY,
+  },
+};
 const koreanNameCollator = new Intl.Collator("ko-KR", {
   sensitivity: "base",
   numeric: false,
 });
 const canvasImageCache = new Map();
+let iconAtlasManifestPromise = null;
 
 export function createProfileSheetPages(profile) {
   const remainingWantedGroups = cloneSheetGroups(profile?.wantedGroups);
@@ -64,19 +83,23 @@ export function getProfileSheetSignature(profile) {
   });
 }
 
-export function createProfileSheetImageDescriptors(profile) {
+export function createProfileSheetImageDescriptors(profile, options = {}) {
+  const renderOptions = getSheetRenderOptions(options);
   const pages = createProfileSheetPages(profile);
   const profileSignature = getProfileSheetSignature(profile);
 
   return pages.map((_, pageIndex) => ({
     name: getProfileSheetImageName(pageIndex, pages.length),
     type: SHEET_IMAGE_TYPE,
-    width: SHEET_WIDTH,
-    height: SHEET_HEIGHT,
+    width: getScaledSheetSize(SHEET_WIDTH, renderOptions.scale),
+    height: getScaledSheetSize(SHEET_HEIGHT, renderOptions.scale),
     generated: true,
     localGenerated: true,
     profileSignature,
     sheetLayoutVersion: SHEET_LAYOUT_VERSION,
+    sheetRenderPurpose: renderOptions.purpose,
+    sheetRenderScale: renderOptions.scale,
+    sheetRenderCacheVersion: SHEET_RENDER_CACHE_VERSION,
     sheetPageIndex: pageIndex,
     sheetPageCount: pages.length,
     order: pageIndex,
@@ -88,8 +111,9 @@ export async function renderProfileSheetImageBlob(profile, options = {}) {
     pageIndex = 0,
     useImages = true,
     type = SHEET_IMAGE_TYPE,
-    quality = SHEET_IMAGE_QUALITY,
+    quality,
   } = options;
+  const renderOptions = getSheetRenderOptions(options);
   const pages = createProfileSheetPages(profile);
   const selectedPageIndex = clampInteger(pageIndex, 0, Math.max(0, pages.length - 1));
   const pageProfile = pages[selectedPageIndex] || pages[0] || profile;
@@ -100,7 +124,8 @@ export async function renderProfileSheetImageBlob(profile, options = {}) {
       pageCount: pages.length,
       useImages,
       type,
-      quality,
+      quality: Number.isFinite(Number(quality)) ? Number(quality) : renderOptions.quality,
+      renderOptions,
     });
   } catch (error) {
     if (useImages) {
